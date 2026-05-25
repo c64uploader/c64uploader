@@ -178,8 +178,9 @@ func (c *APIClient) ftpUpload(conn *ftp.ServerConn, fileData []byte, destination
 	return nil
 }
 
-// uploadDiskViaFTP uploads a disk image to /Temp directory via FTP.
-func (c *APIClient) uploadDiskViaFTP(fileData []byte, filename string) (string, error) {
+// uploadToTempViaFTP uploads arbitrary file data to the /Temp directory via FTP,
+// preserving the caller-supplied filename, and returns the remote path.
+func (c *APIClient) uploadToTempViaFTP(fileData []byte, filename string) (string, error) {
 	// Connect to FTP server.
 	ftpAddr := fmt.Sprintf("%s:21", c.Host)
 	conn, err := c.ftpConnect(ftpAddr)
@@ -197,6 +198,11 @@ func (c *APIClient) uploadDiskViaFTP(fileData []byte, filename string) (string, 
 	}
 
 	return targetPath, nil
+}
+
+// uploadDiskViaFTP uploads a disk image to the /Temp directory via FTP.
+func (c *APIClient) uploadDiskViaFTP(fileData []byte, filename string) (string, error) {
+	return c.uploadToTempViaFTP(fileData, filename)
 }
 
 // injectKeyboardCommand injects a BASIC command into the C64 keyboard buffer.

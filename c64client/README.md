@@ -248,6 +248,13 @@ When you press Return on an entry, the server uploads the file to your Ultimate 
 | **D64/G64/D71/D81/G71** | Disk mounted, first program auto-loaded (`/v1/runners:mount_d64`) |
 | **SID** | Played via the Ultimate's sandboxed SID player (`/v1/runners:sidplay`) — tune only, no demo graphics |
 
+Files you drop into the server's `myfiles/` directory show up under **My Files** in the
+category tree and run the same way. One exception: **`.ue2` firmware/flash-patch files**
+(e.g. `Prkl_FlashPatch_1.1.0s2p7.ue2`) are *upload-only*. Selecting one transfers it to the
+Ultimate's `/Temp` directory via FTP (status shows `uploading...` → `OK Uploaded /Temp/...`)
+and does **not** launch anything — there is no firmware-flash REST endpoint, so you apply the
+patch yourself from the Ultimate's on-device menu afterward.
+
 ### Tips
 
 - The client remembers your position when paging through results

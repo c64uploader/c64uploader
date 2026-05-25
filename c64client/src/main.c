@@ -669,6 +669,42 @@ void run_myfile(const char *path)
     print_status(line_buffer);
 }
 
+// True if name ends in ".ue2" (case-insensitive). Ultimate firmware/flash-patch
+// files are transferred to the device but never launched.
+char is_ue2(const char *name)
+{
+    int len = strlen(name);
+    if (len < 4)
+        return 0;
+    const char *e = name + len - 4;
+    return e[0] == '.'
+        && (e[1] == 'u' || e[1] == 'U')
+        && (e[2] == 'e' || e[2] == 'E')
+        && e[3] == '2';
+}
+
+// Upload file from MYFILES to the device via FTP without launching it (firmware).
+void upload_myfile(const char *path)
+{
+    print_status("uploading...");
+
+    char cmd[64];
+    sprintf(cmd, "UPLOADFILE %s", path);
+    send_command(cmd);
+
+    read_line();  // "OK Uploaded /Temp/xxx" or "ERR xxx"
+    print_status(line_buffer);
+}
+
+// Open a selected MYFILES file: firmware (.ue2) is uploaded only, anything else is run.
+void open_myfile(const char *path)
+{
+    if (is_ue2(path))
+        upload_myfile(path);
+    else
+        run_myfile(path);
+}
+
 // Drive the existing server SEARCH command. Response is one row per result,
 // "id|name|group|year|type" — we only render id+name; the rest is dropped on
 // the floor. category=0 ("All") sends no category arg, so the server runs
@@ -1971,8 +2007,8 @@ int main(void)
                     }
                     else if (menu_types[cursor] == 'F')
                     {
-                        // File in MYFILES - run it directly
-                        run_myfile(menu_paths[cursor]);
+                        // File in MYFILES - run it, or upload-only for firmware (.ue2).
+                        open_myfile(menu_paths[cursor]);
                     }
                     else
                     {
@@ -2020,8 +2056,8 @@ int main(void)
                     }
                     else if (menu_types[cursor] == 'F')
                     {
-                        // File in MYFILES - run it directly
-                        run_myfile(menu_paths[cursor]);
+                        // File in MYFILES - run it, or upload-only for firmware (.ue2).
+                        open_myfile(menu_paths[cursor]);
                     }
                     else
                     {

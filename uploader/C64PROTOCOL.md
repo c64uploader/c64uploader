@@ -81,7 +81,7 @@ OK <count>\n
   - `f` = folder (navigate deeper with MENU)
   - `l` = list (use LISTPATH to get entries)
   - `D` = directory inside MYFILES (navigate deeper with MENU)
-  - `F` = file inside MYFILES (execute with RUNFILE)
+  - `F` = file inside MYFILES (execute with RUNFILE, or transfer firmware `.ue2` files with UPLOADFILE)
   - `b` = browse (legacy — older servers emitted this for "Browse A-Z". Current clients still accept it as a LIST, but the server no longer produces `b`. `Browse A-Z` is now a folder.)
 - `name`: Display name for the item
 - `path`: Full path for this item (used in subsequent commands)
@@ -468,11 +468,13 @@ ERR <error_message>\n
 - `ERR Invalid MYFILES path` - Path doesn't start with MYFILES/
 - `ERR Invalid path` - Path traversal attempt or invalid path
 - `ERR Invalid file type` - File extension not supported
+- `ERR Use UPLOADFILE for firmware files` - File is a `.ue2` firmware/flash-patch (upload-only); use UPLOADFILE instead
 - `ERR File not found` - File doesn't exist
 - `ERR Failed to run: <reason>` - Ultimate API error
 
 #### Supported File Types
 Same as RUN: .prg, .crt, .sid, .d64, .g64, .d71, .d81, .t64, .tap
+(`.ue2` firmware files appear in MYFILES but are upload-only — use UPLOADFILE.)
 
 #### Example
 
@@ -488,7 +490,58 @@ OK Running
 
 ---
 
-### 9. QUIT - Close Connection
+### 9. UPLOADFILE - Transfer File to Device (no launch)
+
+The `UPLOADFILE` command transfers a file from the user's personal `myfiles/`
+directory to the device's `/Temp` directory via FTP **without launching it**. It
+exists for Ultimate firmware/flash-patch files (`.ue2`): there is no REST flash
+endpoint, so the file is only staged on the device and the user applies the patch
+from the Ultimate's on-device menu.
+
+#### Syntax
+```
+UPLOADFILE MYFILES/<path>
+```
+
+#### Arguments
+- `path`: Path to file within myfiles directory (e.g., `MYFILES/firmware/Prkl_FlashPatch_1.1.0s2p7.ue2`)
+
+#### Response Format
+```
+OK Uploaded /Temp/<filename>\n
+```
+
+or
+
+```
+ERR <error_message>\n
+```
+
+The original filename is preserved on the device.
+
+#### Errors
+- `ERR Usage: UPLOADFILE <path>` - Missing path argument
+- `ERR Invalid MYFILES path` - Path doesn't start with MYFILES/
+- `ERR Invalid path` - Path traversal attempt or invalid path
+- `ERR Invalid file type` - File extension not supported
+- `ERR File not found` - File doesn't exist
+- `ERR Failed to upload: <reason>` - FTP error
+
+#### Example
+
+Request:
+```
+UPLOADFILE MYFILES/firmware/Prkl_FlashPatch_1.1.0s2p7.ue2
+```
+
+Response:
+```
+OK Uploaded /Temp/Prkl_FlashPatch_1.1.0s2p7.ue2
+```
+
+---
+
+### 10. QUIT - Close Connection
 
 The `QUIT` command closes the connection gracefully.
 

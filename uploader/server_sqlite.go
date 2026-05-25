@@ -198,6 +198,12 @@ func handleC64CommandSQLite(line string, server *SQLiteServer, apiClient *APICli
 		if !isValidMyFilesExtension(ext) {
 			return "ERR Invalid file type\n"
 		}
+		// Firmware/flash-patch files are transferred, never launched. Reject them
+		// here so a stale client that still sends RUNFILE gets a clear hint rather
+		// than an opaque "unsupported file type" from the runner.
+		if isUploadOnlyExtension(ext) {
+			return "ERR Use UPLOADFILE for firmware files\n"
+		}
 
 		// Run the file
 		slog.Info("RUNFILE: executing file", "path", relPath)
@@ -209,6 +215,54 @@ func handleC64CommandSQLite(line string, server *SQLiteServer, apiClient *APICli
 			return fmt.Sprintf("ERR Failed to run: %v\n", err)
 		}
 		return "OK Running\n"
+
+	case "UPLOADFILE":
+		// Transfer a file from MYFILES to the device via FTP without launching it.
+		// Used for Ultimate firmware/flash-patch files (.ue2): the patch is applied
+		// later from the Ultimate's on-device menu.
+		if len(parts) < 2 {
+			return "ERR Usage: UPLOADFILE <path>\n"
+		}
+		myPath := strings.Join(parts[1:], " ")
+		// Validate MYFILES prefix
+		if !strings.HasPrefix(myPath, "MYFILES/") {
+			return "ERR Invalid MYFILES path\n"
+		}
+		// Extract relative path after MYFILES/
+		relPath := strings.TrimPrefix(myPath, "MYFILES/")
+		filePath := filepath.Join("./myfiles", relPath)
+
+		// Security: Prevent path traversal attacks
+		absBase, err := filepath.Abs("./myfiles")
+		if err != nil {
+			return "ERR Internal error\n"
+		}
+		absFull, err := filepath.Abs(filePath)
+		if err != nil {
+			return "ERR Invalid path\n"
+		}
+		if !strings.HasPrefix(absFull, absBase) {
+			slog.Warn("UPLOADFILE: path traversal attempt blocked", "requested", myPath)
+			return "ERR Invalid path\n"
+		}
+
+		// Validate file extension
+		ext := strings.ToLower(filepath.Ext(filePath))
+		if !isValidMyFilesExtension(ext) {
+			return "ERR Invalid file type\n"
+		}
+
+		// Read and transfer the file via FTP, preserving its original name.
+		slog.Info("UPLOADFILE: transferring file", "path", relPath)
+		fileData, err := os.ReadFile(filePath)
+		if err != nil {
+			return "ERR File not found\n"
+		}
+		remotePath, err := apiClient.uploadToTempViaFTP(fileData, filepath.Base(filePath))
+		if err != nil {
+			return fmt.Sprintf("ERR Failed to upload: %v\n", err)
+		}
+		return fmt.Sprintf("OK Uploaded %s\n", remotePath)
 
 	case "RELEASES":
 		if len(parts) < 5 {
@@ -1254,10 +1308,20 @@ func (s *SQLiteServer) getMyFilesMenu(parts []string) string {
 }
 
 // isValidMyFilesExtension checks if a file extension is valid for MYFILES listing.
+// ext is expected to be lowercase (callers pass strings.ToLower(filepath.Ext(...))).
 func isValidMyFilesExtension(ext string) bool {
 	validExts := map[string]bool{
 		".prg": true, ".d64": true, ".t64": true, ".crt": true,
 		".sid": true, ".tap": true, ".d71": true, ".d81": true, ".g64": true,
+		".ue2": true,
 	}
 	return validExts[ext]
+}
+
+// isUploadOnlyExtension reports whether a file is transferred to the device but
+// never launched. Ultimate firmware/flash-patch files (.ue2) fall here: there is
+// no REST flash endpoint, so we only FTP them across and the user applies the
+// patch from the Ultimate's on-device menu. ext is expected to be lowercase.
+func isUploadOnlyExtension(ext string) bool {
+	return ext == ".ue2"
 }

@@ -126,6 +126,13 @@ Upload a file to C64 Ultimate via FTP from a local path or remote URL:
 ./c64uploader ftp https://example.com/foo.prg /Temp
 ```
 
+This is also how Ultimate firmware/flash-patch files (`.ue2`) get onto the device.
+The native C64 client handles this for you: `.ue2` files placed in the server's
+`myfiles/` directory appear under **My Files** in the browser, and selecting one
+transfers it to `/Temp` via FTP **without launching** (there is no firmware-flash
+REST endpoint — apply the patch from the Ultimate's on-device menu afterward). See
+[c64client/README.md](c64client/README.md#running-programs).
+
 ### Poke Mode
 
 Issue POKE commands to modify C64 memory (e.g., change border color, enable cheats):
