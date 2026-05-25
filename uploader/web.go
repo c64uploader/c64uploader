@@ -79,7 +79,7 @@ func (s *SpiffyServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 // format.
 
 type webMenuItem struct {
-	Type  string `json:"type"`            // "f" folder, "l" list, "b" browse-letters
+	Type  string `json:"type"` // "f" folder, "l" list, "b" browse-letters
 	Name  string `json:"name"`
 	Path  string `json:"path"`
 	Count int    `json:"count,omitempty"` // entry count from the cart protocol
@@ -250,7 +250,7 @@ func (s *SpiffyServer) apiInfo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid id", http.StatusBadRequest)
 		return
 	}
-	e, err := s.db.GetEntryByID(id)
+	e, err := s.sqliteServer.DB().GetEntryByID(id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

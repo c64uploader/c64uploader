@@ -66,22 +66,21 @@ func spiffyCategoryFromCode(code int) string {
 // SpiffyServer wraps the SQLite-backed search and serves the Spiffy API
 // (and the optional web UI under the same listener — see web.go).
 type SpiffyServer struct {
-	db             *DB
-	sqliteServer   *SQLiteServer  // for the web /api/* handlers
-	apiClient      *APIClient     // for the web POST /api/run/<id>
+	sqliteServer   *SQLiteServer // SQLite backend; read the live DB via sqliteServer.DB()
+	apiClient      *APIClient    // for the web POST /api/run/<id>
 	assembly64Path string
-	clientID       string         // optional gate; empty = no gate
+	clientID       string // optional gate; empty = no gate
 }
 
 // startSpiffyHTTP starts the HTTP listener on the given port. It serves
 //   - /leet/search/*  : Spiffy-compatible API for the Ultimate firmware
-//                       built-in Assembly64 browser
+//     built-in Assembly64 browser
 //   - /api/* and /    : optional mobile-friendly web UI (see web.go)
+//
 // Both paths share the same listener and the same SQLite backend.
 // Intended to be run in a goroutine alongside the TCP line-protocol server.
 func startSpiffyHTTP(port int, sqliteServer *SQLiteServer, apiClient *APIClient, assembly64Path, clientID string) error {
 	srv := &SpiffyServer{
-		db:             sqliteServer.db,
 		sqliteServer:   sqliteServer,
 		apiClient:      apiClient,
 		assembly64Path: assembly64Path,
@@ -274,7 +273,7 @@ func (s *SpiffyServer) handleEntries(w http.ResponseWriter, r *http.Request) {
 	// but accept it for protocol compliance.
 	_ = m[2]
 
-	entry, err := s.db.GetEntryByID(id)
+	entry, err := s.sqliteServer.DB().GetEntryByID(id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -305,7 +304,7 @@ func (s *SpiffyServer) handleEntries(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *SpiffyServer) filesForEntry(entryID int64) ([]entryFile, error) {
-	rows, err := s.db.conn.Query(
+	rows, err := s.sqliteServer.DB().conn.Query(
 		`SELECT name, size FROM files WHERE entry_id = ? ORDER BY name`,
 		entryID,
 	)
@@ -354,8 +353,10 @@ func (s *SpiffyServer) scanEntryDir(entry *Entry) []entryFile {
 // -----------------------------------------------------------------------------
 
 // The firmware uses two URL shapes for binary download:
-//   /leet/search/bin/<id>/<cat>/<idx>           (numeric index — from search results)
-//   /leet/search/bin/<id>/<cat>/<filename>      (from filesystem_a64 file_open)
+//
+//	/leet/search/bin/<id>/<cat>/<idx>           (numeric index — from search results)
+//	/leet/search/bin/<id>/<cat>/<filename>      (from filesystem_a64 file_open)
+//
 // We accept both. An optional 5th path component is tolerated but ignored
 // (some implementations append the filename after the idx for human-
 // readable URLs).
@@ -378,7 +379,7 @@ func (s *SpiffyServer) handleBinary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entry, err := s.db.GetEntryByID(id)
+	entry, err := s.sqliteServer.DB().GetEntryByID(id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -595,7 +596,7 @@ func (s *SpiffyServer) searchDB(clauses []AQLClause, start, count int) ([]*Entry
 	q += fmt.Sprintf(" ORDER BY %s %s LIMIT ? OFFSET ?", sortKey, sortDir)
 	args = append(args, count, start)
 
-	rows, err := s.db.conn.Query(q, args...)
+	rows, err := s.sqliteServer.DB().conn.Query(q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("spiffy search query: %w", err)
 	}

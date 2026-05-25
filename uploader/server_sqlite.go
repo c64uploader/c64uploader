@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -314,8 +316,17 @@ func handleC64CommandSQLite(line string, server *SQLiteServer, apiClient *APICli
 
 // SQLiteServer wraps the database for server operations.
 type SQLiteServer struct {
-	db             *DB
+	// db holds the live *DB. It is an atomic pointer so the auto-reindex loop
+	// can hot-swap a freshly rebuilt database under in-flight readers without a
+	// restart. Always read it via DB().
+	db             atomic.Pointer[DB]
 	assembly64Path string
+	reindexMu      sync.Mutex // ensures at most one reindex runs at a time
+}
+
+// DB returns the currently active database handle.
+func (s *SQLiteServer) DB() *DB {
+	return s.db.Load()
 }
 
 // NewSQLiteServer creates a new SQLite-based server.
@@ -332,12 +343,129 @@ func NewSQLiteServer(dbPath, assembly64Path string) (*SQLiteServer, error) {
 		slog.Debug("myfiles directory ready")
 	}
 
-	return &SQLiteServer{db: db, assembly64Path: assembly64Path}, nil
+	s := &SQLiteServer{assembly64Path: assembly64Path}
+	s.db.Store(db)
+	return s, nil
 }
 
 // Close closes the database connection.
 func (s *SQLiteServer) Close() error {
-	return s.db.Close()
+	if d := s.DB(); d != nil {
+		return d.Close()
+	}
+	return nil
+}
+
+// indexSignature is a cheap fingerprint of the Assembly64 tree used to detect
+// additions between reindex polls. Both a new release folder and a new file
+// inside an existing folder bump a directory's mtime, so newest-mtime plus a
+// directory count catches additions and removals. It is comparable with ==.
+type indexSignature struct {
+	maxMTime int64 // newest directory mtime (unix seconds)
+	dirCount int   // total number of directories
+}
+
+// indexCategories are the top-level Assembly64 subtrees the generator indexes.
+// scanSignature walks only these — never the root — so that writing the rebuilt
+// c64uploader.db / *.reindex files into the root cannot re-trigger a reindex.
+var indexCategories = []string{"Games", "Demos", "Music", "Intros", "Graphics", "Discmags"}
+
+// scanSignature computes an indexSignature over the category subtrees of root.
+func scanSignature(root string) (indexSignature, error) {
+	var sig indexSignature
+	for _, cat := range indexCategories {
+		catPath := filepath.Join(root, cat)
+		if _, err := os.Stat(catPath); err != nil {
+			continue // category absent on this mirror; skip
+		}
+		err := filepath.WalkDir(catPath, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil // tolerate transient per-entry NFS errors
+			}
+			if !d.IsDir() {
+				return nil
+			}
+			sig.dirCount++
+			if info, ierr := d.Info(); ierr == nil {
+				if m := info.ModTime().Unix(); m > sig.maxMTime {
+					sig.maxMTime = m
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return sig, err
+		}
+	}
+	return sig, nil
+}
+
+// reindex rebuilds the SQLite database from the Assembly64 directory into a
+// temporary file and atomically hot-swaps it into the running server. At most
+// one reindex runs at a time; a concurrent caller is skipped.
+func (s *SQLiteServer) reindex(assembly64Path, dbPath string) error {
+	if !s.reindexMu.TryLock() {
+		slog.Debug("reindex already in progress; skipping")
+		return nil
+	}
+	defer s.reindexMu.Unlock()
+
+	tmp := dbPath + ".reindex"
+	if err := GenerateSQLiteDB(assembly64Path, tmp); err != nil {
+		return fmt.Errorf("rebuilding database: %w", err)
+	}
+	// Atomic replace (same directory/filesystem). The old open handle keeps the
+	// old inode alive until it is closed below; on NFS this is a silly-rename.
+	if err := os.Rename(tmp, dbPath); err != nil {
+		return fmt.Errorf("swapping database file: %w", err)
+	}
+	newDB, err := OpenDB(dbPath)
+	if err != nil {
+		return fmt.Errorf("opening rebuilt database: %w", err)
+	}
+	old := s.db.Swap(newDB)
+	// Close the previous handle after a grace period so in-flight queries on it
+	// finish first.
+	if old != nil {
+		time.AfterFunc(60*time.Second, func() {
+			if cerr := old.Close(); cerr != nil {
+				slog.Debug("closing previous DB handle", "error", cerr)
+			}
+		})
+	}
+	return nil
+}
+
+// autoReindexLoop periodically checks the Assembly64 directory for added or
+// changed files and, when it detects a change, rebuilds and hot-swaps the DB.
+// Intended to run in its own goroutine for the server's lifetime.
+func (s *SQLiteServer) autoReindexLoop(interval time.Duration, assembly64Path, dbPath string) {
+	last, err := scanSignature(assembly64Path)
+	if err != nil {
+		slog.Warn("auto-reindex: initial scan failed", "error", err)
+	}
+	slog.Info("auto-reindex enabled", "interval", interval, "dirs", last.dirCount)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		sig, serr := scanSignature(assembly64Path)
+		if serr != nil {
+			slog.Warn("auto-reindex: scan failed", "error", serr)
+			continue
+		}
+		if sig == last {
+			continue
+		}
+		slog.Info("auto-reindex: change detected, rebuilding database",
+			"dirs", sig.dirCount, "prev_dirs", last.dirCount)
+		if rerr := s.reindex(assembly64Path, dbPath); rerr != nil {
+			slog.Error("auto-reindex: rebuild failed", "error", rerr)
+			continue
+		}
+		last = sig
+		slog.Info("auto-reindex: database hot-swapped", "dirs", sig.dirCount)
+	}
 }
 
 // HandleMenu returns menu entries for the given path using SQL queries.
@@ -392,7 +520,7 @@ func (s *SQLiteServer) getRootMenu() string {
 	// +1 for My Files entry
 	b.WriteString(fmt.Sprintf("OK %d\n", len(categories)+1))
 	for _, cat := range categories {
-		count, _ := s.db.CountByPathPrefix(cat + "/")
+		count, _ := s.DB().CountByPathPrefix(cat + "/")
 		// Protocol format: type|name|path|count
 		b.WriteString(fmt.Sprintf("f|%s|%s|%d\n", cat, cat, count))
 	}
@@ -432,7 +560,7 @@ func (s *SQLiteServer) getGamesMenu(parts []string) string {
 
 		// Count total entries for this source
 		var totalCount int
-		s.db.conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Games' AND source = ?`, source).Scan(&totalCount)
+		s.DB().conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Games' AND source = ?`, source).Scan(&totalCount)
 
 		// Browse A-Z (type=b for browse)
 		entries = append(entries, fmt.Sprintf("f|Browse A-Z|Games/%s/A-Z|%d", source, totalCount))
@@ -440,12 +568,12 @@ func (s *SQLiteServer) getGamesMenu(parts []string) string {
 		// Add special lists for CSDB
 		if source == "CSDB" {
 			var top200Count int
-			s.db.conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Games' AND source = 'CSDB' AND top200_rank IS NOT NULL`).Scan(&top200Count)
+			s.DB().conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Games' AND source = 'CSDB' AND top200_rank IS NOT NULL`).Scan(&top200Count)
 			entries = append(entries, fmt.Sprintf("l|Top 200|Games/CSDB/Top200|%d", top200Count))
 
 			// 4K count
 			var fourKCount int
-			s.db.conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Games' AND source = 'CSDB' AND is_4k = 1`).Scan(&fourKCount)
+			s.DB().conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Games' AND source = 'CSDB' AND is_4k = 1`).Scan(&fourKCount)
 			entries = append(entries, fmt.Sprintf("l|4K Competition|Games/CSDB/4k|%d", fourKCount))
 		}
 
@@ -481,7 +609,7 @@ func (s *SQLiteServer) getDemosMenu(parts []string) string {
 
 		// Count total entries for this source
 		var totalCount int
-		s.db.conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Demos' AND source = ?`, source).Scan(&totalCount)
+		s.DB().conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Demos' AND source = ?`, source).Scan(&totalCount)
 
 		// Browse A-Z (type=b for browse)
 		entries = append(entries, fmt.Sprintf("f|Browse A-Z|Demos/%s/A-Z|%d", source, totalCount))
@@ -489,27 +617,27 @@ func (s *SQLiteServer) getDemosMenu(parts []string) string {
 		if source == "CSDB" {
 			// Top 200
 			var top200Count int
-			s.db.conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Demos' AND source = 'CSDB' AND top200_rank IS NOT NULL`).Scan(&top200Count)
+			s.DB().conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Demos' AND source = 'CSDB' AND top200_rank IS NOT NULL`).Scan(&top200Count)
 			entries = append(entries, fmt.Sprintf("l|Top 200|Demos/CSDB/Top200|%d", top200Count))
 
 			// Top 500
 			var top500Count int
-			s.db.conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Demos' AND source = 'CSDB' AND top500_rank IS NOT NULL`).Scan(&top500Count)
+			s.DB().conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Demos' AND source = 'CSDB' AND top500_rank IS NOT NULL`).Scan(&top500Count)
 			entries = append(entries, fmt.Sprintf("l|Top 500|Demos/CSDB/Top500|%d", top500Count))
 
 			// By Year
 			var yearCount int
-			s.db.conn.QueryRow(`SELECT COUNT(DISTINCT year) FROM entries WHERE category = 'Demos' AND source = 'CSDB' AND year IS NOT NULL AND year != ''`).Scan(&yearCount)
+			s.DB().conn.QueryRow(`SELECT COUNT(DISTINCT year) FROM entries WHERE category = 'Demos' AND source = 'CSDB' AND year IS NOT NULL AND year != ''`).Scan(&yearCount)
 			entries = append(entries, fmt.Sprintf("f|By Year|Demos/CSDB/Year|%d", yearCount))
 
 			// Year Top 20
 			var yearTop20Count int
-			s.db.conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Demos' AND source = 'CSDB' AND year_rank IS NOT NULL`).Scan(&yearTop20Count)
+			s.DB().conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Demos' AND source = 'CSDB' AND year_rank IS NOT NULL`).Scan(&yearTop20Count)
 			entries = append(entries, fmt.Sprintf("f|Year Top 20|Demos/CSDB/Year-top20|%d", yearTop20Count))
 
 			// Onefile
 			var onefileCount int
-			s.db.conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Demos' AND source = 'CSDB' AND is_onefile = 1`).Scan(&onefileCount)
+			s.DB().conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Demos' AND source = 'CSDB' AND is_onefile = 1`).Scan(&onefileCount)
 			entries = append(entries, fmt.Sprintf("f|Onefile|Demos/CSDB/Onefile|%d", onefileCount))
 		}
 
@@ -564,14 +692,14 @@ func (s *SQLiteServer) getMusicMenu(parts []string) string {
 
 		// Count total entries for this source
 		var totalCount int
-		s.db.conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Music' AND source = ?`, source).Scan(&totalCount)
+		s.DB().conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Music' AND source = ?`, source).Scan(&totalCount)
 
 		// Browse A-Z (type=b for browse)
 		entries = append(entries, fmt.Sprintf("f|Browse A-Z|Music/%s/A-Z|%d", source, totalCount))
 
 		if source == "CSDB" {
 			var top200Count int
-			s.db.conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Music' AND source = 'CSDB' AND top200_rank IS NOT NULL`).Scan(&top200Count)
+			s.DB().conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Music' AND source = 'CSDB' AND top200_rank IS NOT NULL`).Scan(&top200Count)
 			entries = append(entries, fmt.Sprintf("l|Top 200|Music/CSDB/Top200|%d", top200Count))
 		}
 
@@ -605,7 +733,7 @@ func (s *SQLiteServer) getIntrosMenu(parts []string) string {
 
 		// Count total entries for this source
 		var totalCount int
-		s.db.conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Intros' AND source = ?`, source).Scan(&totalCount)
+		s.DB().conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Intros' AND source = ?`, source).Scan(&totalCount)
 
 		// Browse A-Z (type=b for browse)
 		entries = append(entries, fmt.Sprintf("f|Browse A-Z|Intros/%s/A-Z|%d", source, totalCount))
@@ -626,7 +754,7 @@ func (s *SQLiteServer) getGraphicsMenu(parts []string) string {
 	if len(parts) == 1 {
 		// Graphics has only one source, show Browse A-Z directly
 		var totalCount int
-		s.db.conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Graphics' AND source = 'CSDB'`).Scan(&totalCount)
+		s.DB().conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Graphics' AND source = 'CSDB'`).Scan(&totalCount)
 
 		var b strings.Builder
 		b.WriteString("OK 1\n")
@@ -642,7 +770,7 @@ func (s *SQLiteServer) getDiscmagsMenu(parts []string) string {
 	if len(parts) == 1 {
 		// Discmags has only one source, show Browse A-Z directly
 		var totalCount int
-		s.db.conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Discmags' AND source = 'CSDB'`).Scan(&totalCount)
+		s.DB().conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = 'Discmags' AND source = 'CSDB'`).Scan(&totalCount)
 
 		var b strings.Builder
 		b.WriteString("OK 1\n")
@@ -660,7 +788,7 @@ type letterCount struct {
 }
 
 func (s *SQLiteServer) getLetterCounts(category, source string) []letterCount {
-	rows, err := s.db.conn.Query(`
+	rows, err := s.DB().conn.Query(`
 		SELECT
 			CASE
 				WHEN SUBSTR(UPPER(normalized_title), 1, 1) BETWEEN 'A' AND 'Z'
@@ -792,7 +920,7 @@ func (s *SQLiteServer) formatSourceMenu(category string, sources []struct {
 	var entries []string
 	for _, src := range sources {
 		var count int
-		s.db.conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = ? AND source = ?`, category, src.source).Scan(&count)
+		s.DB().conn.QueryRow(`SELECT COUNT(*) FROM entries WHERE category = ? AND source = ?`, category, src.source).Scan(&count)
 		if count > 0 {
 			// Type 'f' for folder (navigates to source submenu)
 			entries = append(entries, fmt.Sprintf("f|%s|%s/%s|%d", src.name, category, src.source, count))
@@ -809,7 +937,7 @@ func (s *SQLiteServer) formatSourceMenu(category string, sources []struct {
 }
 
 func (s *SQLiteServer) getYearMenu(category, source string) string {
-	rows, err := s.db.conn.Query(`
+	rows, err := s.DB().conn.Query(`
 		SELECT year, COUNT(*) as cnt
 		FROM entries
 		WHERE category = ? AND source = ? AND year IS NOT NULL AND year != ''
@@ -839,7 +967,7 @@ func (s *SQLiteServer) getYearMenu(category, source string) string {
 }
 
 func (s *SQLiteServer) getYearTop20Menu(category, source string) string {
-	rows, err := s.db.conn.Query(`
+	rows, err := s.DB().conn.Query(`
 		SELECT year, COUNT(*) as cnt
 		FROM entries
 		WHERE category = ? AND source = ? AND year_rank IS NOT NULL
@@ -869,7 +997,7 @@ func (s *SQLiteServer) getYearTop20Menu(category, source string) string {
 }
 
 func (s *SQLiteServer) getOnefileLetters() string {
-	rows, err := s.db.conn.Query(`
+	rows, err := s.DB().conn.Query(`
 		SELECT
 			CASE
 				WHEN SUBSTR(UPPER(normalized_title), 1, 1) BETWEEN 'A' AND 'Z'
@@ -1003,7 +1131,7 @@ func (s *SQLiteServer) handleGroupedList(whereClause string, args []interface{},
 	// Get total count of distinct titles
 	countQuery := fmt.Sprintf(`SELECT COUNT(DISTINCT normalized_title) FROM entries WHERE %s`, whereClause)
 	var total int
-	s.db.conn.QueryRow(countQuery, args...).Scan(&total)
+	s.DB().conn.QueryRow(countQuery, args...).Scan(&total)
 
 	if offset >= total {
 		return fmt.Sprintf("OK 0 %d\n.\n", total)
@@ -1019,7 +1147,7 @@ func (s *SQLiteServer) handleGroupedList(whereClause string, args []interface{},
 		LIMIT ? OFFSET ?`, whereClause)
 
 	args = append(args, count, offset)
-	rows, err := s.db.conn.Query(query, args...)
+	rows, err := s.DB().conn.Query(query, args...)
 	if err != nil {
 		return fmt.Sprintf("OK 0 %d\n.\n", total)
 	}
@@ -1068,7 +1196,7 @@ func (s *SQLiteServer) HandleSearch(query, category string, offset, count int) s
 		JOIN entries_fts ON e.id = entries_fts.rowid
 		WHERE %s`, whereClause)
 	var total int
-	s.db.conn.QueryRow(countQuery, args...).Scan(&total)
+	s.DB().conn.QueryRow(countQuery, args...).Scan(&total)
 
 	if offset >= total {
 		return fmt.Sprintf("OK 0 %d\n.\n", total)
@@ -1084,7 +1212,7 @@ func (s *SQLiteServer) HandleSearch(query, category string, offset, count int) s
 		LIMIT ? OFFSET ?`, whereClause)
 
 	args = append(args, count, offset)
-	rows, err := s.db.conn.Query(selectQuery, args...)
+	rows, err := s.DB().conn.Query(selectQuery, args...)
 	if err != nil {
 		return fmt.Sprintf("OK 0 %d\n.\n", total)
 	}
@@ -1113,7 +1241,7 @@ func (s *SQLiteServer) HandleSearch(query, category string, offset, count int) s
 // HandleInfo returns detailed information about an entry.
 // Format: OK\n followed by LABEL|value lines, ending with .\n
 func (s *SQLiteServer) HandleInfo(id int64) string {
-	entry, err := s.db.GetEntryByID(id)
+	entry, err := s.DB().GetEntryByID(id)
 	if err != nil || entry == nil {
 		return "ERR Entry not found\n"
 	}
@@ -1183,7 +1311,7 @@ func (s *SQLiteServer) HandleReleases(path, title string, offset, count int) str
 	// Get total count
 	var total int
 	countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM entries WHERE %s`, whereClause)
-	s.db.conn.QueryRow(countQuery, args...).Scan(&total)
+	s.DB().conn.QueryRow(countQuery, args...).Scan(&total)
 
 	if offset >= total {
 		return fmt.Sprintf("OK 0 %d\n.\n", total)
@@ -1198,7 +1326,7 @@ func (s *SQLiteServer) HandleReleases(path, title string, offset, count int) str
 		LIMIT ? OFFSET ?`, whereClause)
 
 	args = append(args, count, offset)
-	rows, err := s.db.conn.Query(query, args...)
+	rows, err := s.DB().conn.Query(query, args...)
 	if err != nil {
 		return fmt.Sprintf("OK 0 %d\n.\n", total)
 	}
@@ -1226,7 +1354,7 @@ func (s *SQLiteServer) HandleReleases(path, title string, offset, count int) str
 
 // GetFilePath returns the full path to the primary file of an entry.
 func (s *SQLiteServer) GetFilePath(id int64) (string, error) {
-	entry, err := s.db.GetEntryByID(id)
+	entry, err := s.DB().GetEntryByID(id)
 	if err != nil || entry == nil {
 		return "", fmt.Errorf("entry not found")
 	}

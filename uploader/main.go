@@ -400,6 +400,7 @@ func runServer(args []string) {
 	port := fs.Int("port", 6465, "C64 protocol server port")
 	spiffyPort := fs.Int("spiffy-http-port", 0, "Spiffy-compatible HTTP API port (0 = disabled). Lets the Ultimate firmware's built-in Assembly64 browser use this server as its upstream.")
 	spiffyClientID := fs.String("spiffy-client-id", "", "Optional Client-Id header value the Spiffy HTTP server requires (default: unauthenticated).")
+	reindexInterval := fs.Duration("reindex-interval", 0, "Poll the Assembly64 directory this often and hot-swap a rebuilt database when files are added/changed (0 = disabled).")
 	fs.Parse(args)
 
 	// Set log level.
@@ -435,6 +436,12 @@ func runServer(args []string) {
 		os.Exit(1)
 	}
 	defer sqliteServer.Close()
+
+	// Optional auto-reindex: poll the Assembly64 directory and hot-swap a freshly
+	// rebuilt database when files are added/changed (NFS-friendly, no inotify).
+	if *reindexInterval > 0 {
+		go sqliteServer.autoReindexLoop(*reindexInterval, a64Path, dbPath)
+	}
 
 	// Optional Spiffy-compatible HTTP listener for the Ultimate firmware's
 	// built-in Assembly64 browser. Backed by the same SQLite handle as the
