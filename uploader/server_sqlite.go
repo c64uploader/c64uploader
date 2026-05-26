@@ -1164,11 +1164,19 @@ func (s *SQLiteServer) getOnefileLetters() string {
 // This matches the JSON server behavior - entries with same normalized title are
 // grouped together with a count, allowing the user to select and see all releases.
 // The letter parameter is optional - if provided, it filters by first letter of title.
+//
+// Special case: MYFILES paths are served from the filesystem (not the SQLite
+// index) so the cart can browse user-supplied files with the same paginated
+// LIST code path it uses for Assembly64 entries.
 func (s *SQLiteServer) HandleListPath(path string, offset, count int, letter string) string {
 	// Parse path to determine category, source, and filters
 	parts := strings.Split(path, "/")
 	if len(parts) < 1 {
 		return "OK 0 0\n.\n"
+	}
+
+	if parts[0] == "MYFILES" {
+		return s.listMyFilesEntries(parts, offset, count)
 	}
 
 	category := parts[0]
@@ -1488,6 +1496,82 @@ func (s *SQLiteServer) GetFilePath(id int64) (string, error) {
 	}
 
 	return filepath.Join(s.assembly64Path, entry.Path, entry.PrimaryFile), nil
+}
+
+// listMyFilesEntries serves a MYFILES directory in the LIST-style entry
+// format (id|name|cat|count|trainers) so the cart can browse user-supplied
+// files through the same paginated PAGE_LIST code it uses for Assembly64.
+// id is 0 (entries aren't in the SQLite index); cat is "D" for subdirs or
+// "F" for files, which the cart uses to dispatch ENTER (navigate / run /
+// upload). count=1 and trainers=-1 are placeholders.
+func (s *SQLiteServer) listMyFilesEntries(parts []string, offset, count int) string {
+	subPath := ""
+	if len(parts) > 1 {
+		subPath = strings.Join(parts[1:], "/")
+	}
+	dirPath := filepath.Join(s.myfilesPath, subPath)
+
+	// Path-traversal guard (same as getMyFilesMenu).
+	absBase, err := filepath.Abs(s.myfilesPath)
+	if err != nil {
+		slog.Error("listMyFilesEntries: failed to resolve base path", "error", err)
+		return "OK 0 0\n.\n"
+	}
+	absFull, err := filepath.Abs(dirPath)
+	if err != nil {
+		slog.Error("listMyFilesEntries: failed to resolve full path", "path", dirPath, "error", err)
+		return "OK 0 0\n.\n"
+	}
+	if !strings.HasPrefix(absFull, absBase) {
+		slog.Warn("listMyFilesEntries: path traversal attempt blocked", "requested", subPath, "resolved", absFull)
+		return "OK 0 0\n.\n"
+	}
+
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		slog.Error("listMyFilesEntries: failed to read directory", "path", dirPath, "error", err)
+		return "OK 0 0\n.\n"
+	}
+
+	var rows []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		if entry.IsDir() {
+			rows = append(rows, fmt.Sprintf("0|%s|D|1|-1", name))
+		} else {
+			ext := strings.ToLower(filepath.Ext(name))
+			if isValidMyFilesExtension(ext) {
+				rows = append(rows, fmt.Sprintf("0|%s|F|1|-1", name))
+			}
+		}
+	}
+
+	// Stable sort so pagination is deterministic.
+	sort.Slice(rows, func(i, j int) bool {
+		return strings.ToLower(rows[i]) < strings.ToLower(rows[j])
+	})
+
+	total := len(rows)
+	lo := offset
+	if lo > total {
+		lo = total
+	}
+	hi := lo + count
+	if hi > total {
+		hi = total
+	}
+	page := rows[lo:hi]
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "OK %d %d\n", len(page), total)
+	for _, r := range page {
+		b.WriteString(r + "\n")
+	}
+	b.WriteString(".\n")
+	return b.String()
 }
 
 // getMyFilesMenu returns directory listing for the MYFILES path, paginated.
