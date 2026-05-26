@@ -542,6 +542,16 @@ void load_menu(const char *path)
         item_count++;
     }
 
+    // If the server emitted more rows than the cart can buffer (MyFiles
+    // directories can grow without bound), drain to "." so the next protocol
+    // exchange isn't misaligned. Without this the leftover row bytes leak
+    // into the next response and the cart freezes within a few keystrokes.
+    {
+        int safety = 200;
+        while (line_buffer[0] != '.' && safety-- > 0)
+            read_line();
+    }
+
     // Save current path (from our snapshot, since menu_paths[] was rewritten)
     strncpy(menu_path, saved_path, 63);
     menu_path[63] = 0;

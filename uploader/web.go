@@ -92,7 +92,8 @@ type webMenuResponse struct {
 
 func (s *SpiffyServer) apiMenu(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
-	resp := s.sqliteServer.HandleMenu(path)
+	// Web UI doesn't paginate menus today — ask for everything in one page.
+	resp := s.sqliteServer.HandleMenu(path, 0, 1<<30)
 	items := parseMenuItems(resp)
 	writeJSON(w, webMenuResponse{Path: path, Items: items})
 }

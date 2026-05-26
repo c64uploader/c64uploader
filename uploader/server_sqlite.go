@@ -115,7 +115,7 @@ func handleC64CommandSQLite(line string, server *SQLiteServer, apiClient *APICli
 
 	switch cmd {
 	case "CATS":
-		return server.HandleMenu("")
+		return server.HandleMenu("", 0, 1<<30)
 
 	case "LIST":
 		// LIST offset count path [letter] - List entries matching path, optionally filtered by letter
@@ -325,11 +325,30 @@ func handleC64CommandSQLite(line string, server *SQLiteServer, apiClient *APICli
 		return server.HandleReleases(path, title, offset, count)
 
 	case "MENU":
+		// Two accepted forms:
+		//   MENU                            -> root menu, all entries
+		//   MENU <path>                     -> legacy; full subtree, no pagination
+		//   MENU <offset> <count> <path>    -> paginated; cart uses this for MyFiles
+		// Heuristic for paginated form: 4+ args AND parts[1], parts[2] both parse as
+		// integers. Menu paths never start with a digit in practice (Games, Demos,
+		// MYFILES, ...), so this is safe.
 		path := ""
+		offset := 0
+		count := 1 << 30 // "all"
+		if len(parts) >= 4 {
+			if o, err1 := strconv.Atoi(parts[1]); err1 == nil {
+				if c, err2 := strconv.Atoi(parts[2]); err2 == nil {
+					offset = o
+					count = c
+					path = strings.Join(parts[3:], " ")
+					return server.HandleMenu(path, offset, count)
+				}
+			}
+		}
 		if len(parts) >= 2 {
 			path = strings.Join(parts[1:], " ")
 		}
-		return server.HandleMenu(path)
+		return server.HandleMenu(path, offset, count)
 
 	case "LISTPATH":
 		// LISTPATH offset count path [letter] - List entries matching path prefix (legacy, use LIST instead)
@@ -530,47 +549,95 @@ func (s *SQLiteServer) autoReindexLoop(interval time.Duration, assembly64Path, d
 }
 
 // HandleMenu returns menu entries for the given path using SQL queries.
-func (s *SQLiteServer) HandleMenu(path string) string {
-	slog.Debug("HandleMenu called", "path", path)
+//
+// offset/count paginate the response: at most `count` entries starting from
+// `offset` are returned, and the response header is `OK <returned> <total>`
+// so the client can ask for the next page. Only getMyFilesMenu actually
+// uses these — the other category menus return small, fixed-size lists
+// that always fit a single page, so HandleMenu post-processes their output
+// to format the header consistently and (if the caller asked for it) slice
+// the rows.
+func (s *SQLiteServer) HandleMenu(path string, offset, count int) string {
+	slog.Debug("HandleMenu called", "path", path, "offset", offset, "count", count)
 
 	if path == "" {
-		// Root menu - list categories
-		return s.getRootMenu()
+		// Root menu - list categories. Tiny, always fits one page.
+		return paginateMenuResponse(s.getRootMenu(), offset, count)
 	}
 
 	parts := strings.Split(path, "/")
 	slog.Debug("HandleMenu parts", "parts", parts, "len", len(parts))
 
 	if len(parts) == 0 {
-		return "OK 0\n.\n"
+		return "OK 0 0\n.\n"
 	}
 
 	// Letter-grid menu: when the user enters "Browse A-Z" we route here and
 	// return 27 list entries (A..Z plus #) that the client renders as a grid.
 	if parts[len(parts)-1] == "A-Z" {
-		return s.getLetterGridMenu(path)
+		return paginateMenuResponse(s.getLetterGridMenu(path), offset, count)
 	}
 
 	category := parts[0]
 
 	switch category {
 	case "Games":
-		return s.getGamesMenu(parts)
+		return paginateMenuResponse(s.getGamesMenu(parts), offset, count)
 	case "Demos":
-		return s.getDemosMenu(parts)
+		return paginateMenuResponse(s.getDemosMenu(parts), offset, count)
 	case "Music":
-		return s.getMusicMenu(parts)
+		return paginateMenuResponse(s.getMusicMenu(parts), offset, count)
 	case "Intros":
-		return s.getIntrosMenu(parts)
+		return paginateMenuResponse(s.getIntrosMenu(parts), offset, count)
 	case "Graphics":
-		return s.getGraphicsMenu(parts)
+		return paginateMenuResponse(s.getGraphicsMenu(parts), offset, count)
 	case "Discmags":
-		return s.getDiscmagsMenu(parts)
+		return paginateMenuResponse(s.getDiscmagsMenu(parts), offset, count)
 	case "MYFILES":
-		return s.getMyFilesMenu(parts)
+		// getMyFilesMenu paginates natively — the directory can hold an
+		// unbounded number of files, slicing in memory after building the
+		// full string would be wasteful.
+		return s.getMyFilesMenu(parts, offset, count)
 	default:
-		return "OK 0\n.\n"
+		return "OK 0 0\n.\n"
 	}
+}
+
+// paginateMenuResponse takes a legacy menu response (`OK N\n<rows>\n.\n`) and
+// rewrites it as a paginated response (`OK <returned> <total>\n<sliced>\n.\n`).
+// Used for small menus that don't paginate natively. For typical sizes
+// (categories, source lists, letter grids) the cart asks for count >= entries
+// and the slice is a no-op.
+func paginateMenuResponse(legacy string, offset, count int) string {
+	nl := strings.IndexByte(legacy, '\n')
+	if nl < 0 || !strings.HasPrefix(legacy, "OK ") {
+		return legacy // ERR or malformed; pass through
+	}
+	rest := legacy[nl+1:]
+	// Split body into rows; drop the trailing "." sentinel.
+	rows := strings.Split(strings.TrimSuffix(rest, ".\n"), "\n")
+	if len(rows) > 0 && rows[len(rows)-1] == "" {
+		rows = rows[:len(rows)-1]
+	}
+	total := len(rows)
+	lo := offset
+	if lo > total {
+		lo = total
+	}
+	hi := lo + count
+	if hi > total {
+		hi = total
+	}
+	page := rows[lo:hi]
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "OK %d %d\n", len(page), total)
+	for _, r := range page {
+		b.WriteString(r)
+		b.WriteByte('\n')
+	}
+	b.WriteString(".\n")
+	return b.String()
 }
 
 func (s *SQLiteServer) getRootMenu() string {
@@ -1423,10 +1490,12 @@ func (s *SQLiteServer) GetFilePath(id int64) (string, error) {
 	return filepath.Join(s.assembly64Path, entry.Path, entry.PrimaryFile), nil
 }
 
-// getMyFilesMenu returns directory listing for the MYFILES path.
+// getMyFilesMenu returns directory listing for the MYFILES path, paginated.
 // MYFILES paths map to the configured myfiles directory on the filesystem
-// (set via -myfiles, defaulting to <assembly64>/Myfiles).
-func (s *SQLiteServer) getMyFilesMenu(parts []string) string {
+// (set via -myfiles, defaulting to <assembly64>/Myfiles). Unlike the other
+// category menus, this one can be arbitrarily large (user drops files in
+// there), so we paginate natively to avoid building a huge string.
+func (s *SQLiteServer) getMyFilesMenu(parts []string, offset, count int) string {
 	subPath := ""
 	if len(parts) > 1 {
 		subPath = strings.Join(parts[1:], "/")
@@ -1437,25 +1506,24 @@ func (s *SQLiteServer) getMyFilesMenu(parts []string) string {
 	absBase, err := filepath.Abs(s.myfilesPath)
 	if err != nil {
 		slog.Error("getMyFilesMenu: failed to resolve base path", "error", err)
-		return "OK 0\n.\n"
+		return "OK 0 0\n.\n"
 	}
 	absFull, err := filepath.Abs(dirPath)
 	if err != nil {
 		slog.Error("getMyFilesMenu: failed to resolve full path", "path", dirPath, "error", err)
-		return "OK 0\n.\n"
+		return "OK 0 0\n.\n"
 	}
 	if !strings.HasPrefix(absFull, absBase) {
 		slog.Warn("getMyFilesMenu: path traversal attempt blocked", "requested", subPath, "resolved", absFull)
-		return "OK 0\n.\n"
+		return "OK 0 0\n.\n"
 	}
 
 	entries, err := os.ReadDir(dirPath)
 	if err != nil {
 		slog.Error("getMyFilesMenu: failed to read directory", "path", dirPath, "error", err)
-		return "OK 0\n.\n"
+		return "OK 0 0\n.\n"
 	}
 
-	var b strings.Builder
 	var validEntries []string
 
 	for _, entry := range entries {
@@ -1483,13 +1551,26 @@ func (s *SQLiteServer) getMyFilesMenu(parts []string) string {
 		}
 	}
 
-	// Sort entries alphabetically (case-insensitive)
+	// Sort entries alphabetically (case-insensitive). Stable order matters
+	// for pagination: page N+1 must start where page N left off.
 	sort.Slice(validEntries, func(i, j int) bool {
 		return strings.ToLower(validEntries[i]) < strings.ToLower(validEntries[j])
 	})
 
-	b.WriteString(fmt.Sprintf("OK %d\n", len(validEntries)))
-	for _, entry := range validEntries {
+	total := len(validEntries)
+	lo := offset
+	if lo > total {
+		lo = total
+	}
+	hi := lo + count
+	if hi > total {
+		hi = total
+	}
+	page := validEntries[lo:hi]
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "OK %d %d\n", len(page), total)
+	for _, entry := range page {
 		b.WriteString(entry + "\n")
 	}
 	b.WriteString(".\n")

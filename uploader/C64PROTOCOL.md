@@ -61,22 +61,27 @@ The `MENU` command navigates the hierarchical menu structure. It returns menu it
 
 #### Syntax
 ```
-MENU [path]
+MENU                              # legacy: full menu at root
+MENU <path>                       # legacy: full menu at <path>
+MENU <offset> <count> <path>      # paginated: page of <count> items starting at <offset>
 ```
 
 #### Arguments
 - `path`: (Optional) Menu path to navigate to. If empty, returns root menu.
+- `offset`, `count`: (Paginated form only) Window into the full menu list. The server returns at most `count` entries starting from `offset`. Used for MyFiles directories that can hold unbounded numbers of files; other menus (categories, source lists, the A-Z letter grid) are small enough that pagination is a no-op.
 
 #### Response Format
 ```
-OK <count>\n
+OK <returned> <total>\n
 <type>|<name>|<path>|<count>\n
 <type>|<name>|<path>|<count>\n
 ...
 .\n
 ```
 
-- `count`: Number of items returned (up to 27 for the A-Z letter grid; otherwise at most 20)
+- `returned`: Number of entry lines in this response (≤ requested `count`)
+- `total`: Total entries available at this path (so the client knows whether to ask for more)
+- Older servers send `OK <count>` (single number). Clients should accept either form: parse the first number as `returned` and, if a second number follows, use that as `total`; otherwise treat `total == returned`.
 - `type`: Item type code:
   - `f` = folder (navigate deeper with MENU)
   - `l` = list (use LISTPATH to get entries)
