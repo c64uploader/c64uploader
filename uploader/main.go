@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +16,54 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+// loadServerConfig parses a flat key=value config file and applies any
+// recognized keys to fs, skipping keys that were already set on the command
+// line (skipSet) so CLI args always win. Unknown keys are an error so typos
+// in deployment configs are surfaced rather than silently ignored.
+//
+// Syntax: one `key = value` per line. `#` starts a comment to end-of-line.
+// Whitespace around `=` and at the start/end of value is stripped. Keys
+// match the flag names exactly (e.g. `spiffy-http-port`). Boolean flags
+// accept any value the stdlib's flag package accepts: `true`/`false`,
+// `1`/`0`, `t`/`f`.
+func loadServerConfig(fs *flag.FlagSet, path string, skipSet map[string]bool) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("opening config %s: %w", path, err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		line := scanner.Text()
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = line[:i]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq < 0 {
+			return fmt.Errorf("%s:%d: expected `key = value`, got %q", path, lineNo, line)
+		}
+		key := strings.TrimSpace(line[:eq])
+		val := strings.TrimSpace(line[eq+1:])
+		if fs.Lookup(key) == nil {
+			return fmt.Errorf("%s:%d: unknown key %q", path, lineNo, key)
+		}
+		if skipSet[key] {
+			continue // CLI flag already provided this; CLI wins
+		}
+		if err := fs.Set(key, val); err != nil {
+			return fmt.Errorf("%s:%d: %s = %q: %w", path, lineNo, key, val, err)
+		}
+	}
+	return scanner.Err()
+}
 
 // isURL checks if a string is a URL.
 func isURL(s string) bool {
@@ -402,7 +451,20 @@ func runServer(args []string) {
 	spiffyPort := fs.Int("spiffy-http-port", 0, "Spiffy-compatible HTTP API port (0 = disabled). Lets the Ultimate firmware's built-in Assembly64 browser use this server as its upstream.")
 	spiffyClientID := fs.String("spiffy-client-id", "", "Optional Client-Id header value the Spiffy HTTP server requires (default: unauthenticated).")
 	reindexInterval := fs.Duration("reindex-interval", 0, "Poll the Assembly64 directory this often and hot-swap a rebuilt database when files are added/changed (0 = disabled).")
+	configPath := fs.String("config", "", "Path to a config file (key = value per line, # comments). CLI flags override values from the file.")
 	fs.Parse(args)
+
+	// Apply -config after CLI parse so we can record which flags were set on
+	// the command line and have those win over the file. Fail loudly on a
+	// missing/unparseable file — the user explicitly asked for it.
+	if *configPath != "" {
+		cliSet := make(map[string]bool)
+		fs.Visit(func(f *flag.Flag) { cliSet[f.Name] = true })
+		if err := loadServerConfig(fs, *configPath, cliSet); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	// Set log level.
 	if *verbose {

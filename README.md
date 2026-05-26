@@ -174,7 +174,27 @@ Start the C64 protocol server for the C64 client:
 - `-spiffy-http-port <port>` - Spiffy-compatible HTTP API port (default: `0` = disabled). When set, a second listener on this port serves the same `/leet/search/` REST API the Ultimate firmware's built-in Assembly64 browser expects, backed by our SQLite index. Lets the stock firmware browser use this server as its upstream — no custom C64 cart needed. See `uploader/SPIFFY_HTTP_API.md` for the wire format.
 - `-spiffy-client-id <value>` - Optional `Client-Id` header value the Spiffy listener requires (default: empty = unauthenticated).
 - `-reindex-interval <duration>` - Poll the Assembly64 directory this often and hot-swap a freshly rebuilt database when files are added or changed (default: `0` = disabled, e.g. `1h`). NFS-friendly: it polls directory mtimes rather than relying on inotify (which doesn't see changes made on an NFS server or by other clients). On a detected change it rebuilds the index in the background and swaps it in atomically — no restart, no downtime. Detects new release folders and new files inside existing folders; in-place edits of an existing file's contents are not detected. The server also rebuilds the index **once at startup** when this flag is set, so changes made while the server was down are picked up without needing a separate `sqlitegen` run; pick an interval based on how often new files land while the server is running.
+- `-config <path>` - Load defaults from a flat `key = value` config file (see below). Any CLI flag passed alongside `-config` overrides the file's value for that key.
 - `-v` - Enable verbose debug logging
+
+**Config file (`-config`):**
+
+When invocation lines get long (systemd units, NAS deployments), put the steady values in a file:
+
+```ini
+# /etc/c64uploader.conf
+host = c64u.alanara.fi
+assembly64 = /data/Retro/Assembly64
+myfiles = /data/Retro/Assembly64/Myfiles
+spiffy-http-port = 8000
+reindex-interval = 1h
+# v = true
+```
+
+- One `key = value` per line. `#` starts a comment to end-of-line. Blank lines OK. Whitespace around `=` ignored.
+- Keys match the flag names exactly (`spiffy-http-port`, not `spiffy_http_port`). Boolean flags accept `true` / `false` / `1` / `0`.
+- Precedence: defaults → config file → CLI flags. Anything you pass on the command line overrides the file.
+- Unknown keys, a missing file, or a malformed line all fail loudly with file:line context so typos in production configs don't get silently ignored.
 
 **Example:**
 ```bash
@@ -183,6 +203,9 @@ Start the C64 protocol server for the C64 client:
 # Auto-pick up files added to an NFS-mounted collection. The server rebuilds the
 # index once at startup, then polls hourly for additions made while it's running.
 ./c64uploader server -assembly64 /nas/Retro/Assembly64 -reindex-interval 1h
+
+# Same thing but with the settings parked in a config file
+./c64uploader server -config /etc/c64uploader.conf
 ```
 
 The C64 protocol is a simple line-based protocol optimized for low-bandwidth C64 communication.
