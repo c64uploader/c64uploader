@@ -541,7 +541,62 @@ OK Uploaded /Temp/Prkl_FlashPatch_1.1.0s2p7.ue2
 
 ---
 
-### 10. QUIT - Close Connection
+### 10. DOWNLOAD - Save Entry to Device (no launch)
+
+The `DOWNLOAD` command transfers an Assembly64 entry's primary file to the device's
+`/Temp` directory via FTP **without launching it**, preserving the original filename.
+This is the counterpart of `RUN`: same lookup-by-id and FTP primitive, but the user
+gets the file staged on the Ultimate so they can keep it (e.g. move it from `/Temp`
+to a real SD card or USB destination from the Ultimate's on-device file manager).
+
+#### Syntax
+```
+DOWNLOAD <id>
+```
+
+#### Arguments
+- `id`: Numeric entry ID (same id space as `RUN` and `INFO`)
+
+#### Response Format
+```
+OK Saved /Temp/<filename>\n
+```
+
+or
+
+```
+ERR <error_message>\n
+```
+
+#### Errors
+- `ERR Usage: DOWNLOAD <id>` - Missing id argument
+- `ERR Invalid ID` - Non-numeric id
+- `ERR entry not found` - No entry with that id
+- `ERR Failed to read file: <reason>` - Source file missing or unreadable
+- `ERR Failed to upload: <reason>` - FTP error
+
+#### Notes
+- Only the entry's `primary_file` is sent. For container formats (`.d64`, `.crt`,
+  `.sid`, `.t64`, `.tap`) the container *is* the single file — works as expected.
+  For multi-PRG releases, sidecars/extras are not transferred — drill into the
+  release with `INFO <id>` and reissue `DOWNLOAD` against individual entries if
+  they have their own ids.
+
+#### Example
+
+Request:
+```
+DOWNLOAD 12345
+```
+
+Response:
+```
+OK Saved /Temp/MyDemo.prg
+```
+
+---
+
+### 11. QUIT - Close Connection
 
 The `QUIT` command closes the connection gracefully.
 

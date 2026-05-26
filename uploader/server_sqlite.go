@@ -145,6 +145,33 @@ func handleC64CommandSQLite(line string, server *SQLiteServer, apiClient *APICli
 		}
 		return server.HandleInfo(id)
 
+	case "DOWNLOAD":
+		// Transfer an Assembly64 entry's primary file to the device's /Temp via
+		// FTP without launching it, preserving the original filename. Same FTP
+		// primitive as UPLOADFILE, but sourced from an entry id instead of a
+		// MYFILES path.
+		if len(parts) < 2 {
+			return "ERR Usage: DOWNLOAD <id>\n"
+		}
+		id, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			return "ERR Invalid ID\n"
+		}
+		filePath, err := server.GetFilePath(id)
+		if err != nil {
+			return fmt.Sprintf("ERR %s\n", err.Error())
+		}
+		slog.Info("DOWNLOAD: transferring file", "id", id, "path", filePath)
+		fileData, err := os.ReadFile(filePath)
+		if err != nil {
+			return fmt.Sprintf("ERR Failed to read file: %v\n", err)
+		}
+		remotePath, err := apiClient.uploadToTempViaFTP(fileData, filepath.Base(filePath))
+		if err != nil {
+			return fmt.Sprintf("ERR Failed to upload: %v\n", err)
+		}
+		return fmt.Sprintf("OK Saved %s\n", remotePath)
+
 	case "RUN":
 		if len(parts) < 2 {
 			return "ERR Usage: RUN <id>\n"

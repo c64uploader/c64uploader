@@ -108,6 +108,8 @@ void draw_list(const char *title);
 void draw_releases(void);
 void do_releases(const char *category, const char *title, int start);
 void run_myfile(const char *path);
+void download_entry(long id);
+void upload_myfile(const char *path);
 static bool is_letter_grid(void);
 void update_letter_grid_cursor(int old_cursor, int new_cursor);
 static void draw_search_input(void);
@@ -669,6 +671,20 @@ void run_myfile(const char *path)
     print_status(line_buffer);
 }
 
+// Save selected Assembly64 entry's primary file to the device's /Temp via FTP
+// without launching it. Preserves the original filename.
+void download_entry(long id)
+{
+    print_status("downloading...");
+
+    char cmd[32];
+    sprintf(cmd, "DOWNLOAD %ld", id);
+    send_command(cmd);
+
+    read_line();  // "OK Saved /Temp/xxx" or "ERR xxx"
+    print_status(line_buffer);
+}
+
 // True if name ends in ".ue2" (case-insensitive). Ultimate firmware/flash-patch
 // files are transferred to the device but never launched.
 char is_ue2(const char *name)
@@ -1117,6 +1133,9 @@ char get_key(void)
                 if (k == KSCAN_SLASH) return '/';
                 if (k == KSCAN_CSR_RIGHT && !shift) return '>';  // Right = enter category
                 if (k == KSCAN_CSR_RIGHT && shift) return 8;  // Left = back
+                // D = upload-only on a MyFiles file. Main switch ignores it
+                // for folders/categories so we can return it unconditionally.
+                if (k == KSCAN_D) return 'D';
             }
         }
         // In list view
@@ -1127,6 +1146,7 @@ char get_key(void)
             if (k == KSCAN_N) return 'n';
             if (k == KSCAN_P) return 'p';
             if (k == KSCAN_I) return 'i';  // Info
+            if (k == KSCAN_D) return 'D';  // Download entry to /Temp (no launch)
             if (k == KSCAN_CSR_RIGHT && !shift) return '>';  // Right = releases
             if (k == KSCAN_CSR_RIGHT && shift) return 8;  // Left = back
         }
@@ -1172,6 +1192,7 @@ char get_key(void)
                 if (k == KSCAN_N) return 'n';
                 if (k == KSCAN_P) return 'p';
                 if (k == KSCAN_I) return 'i';
+                if (k == KSCAN_D) return 'D';  // Download entry to /Temp (no launch)
                 if (k == KSCAN_CSR_RIGHT && !shift) return '\r';
             }
             // Letter / digit / space fallthrough: typed character. Space
@@ -1192,6 +1213,7 @@ char get_key(void)
             if (k == KSCAN_N) return 'n';
             if (k == KSCAN_P) return 'p';
             if (k == KSCAN_I) return 'i';  // Info
+            if (k == KSCAN_D) return 'D';  // Download release to /Temp (no launch)
             if (k == KSCAN_CSR_RIGHT && shift) return 8;  // Left = back
         }
         // In info screen - any key returns
@@ -2333,6 +2355,30 @@ int main(void)
                         draw_releases();
                 }
                 break;
+
+            case 'D':
+                // Save selected entry's file to the Ultimate's /Temp/ via FTP
+                // without launching. In a result list (PAGE_LIST/RELEASES/
+                // SEARCH) the selected entry's primary file is fetched by id;
+                // in the MyFiles menu the selected file is pushed via
+                // UPLOADFILE. When the user is typing into the search input
+                // box, we fall through to the default case so 'D' is appended
+                // to the query like any other letter.
+                if (current_page == PAGE_CATS && item_count > 0 &&
+                    menu_types[cursor] == 'F')
+                {
+                    upload_myfile(menu_paths[cursor]);
+                    break;
+                }
+                if (item_count > 0 &&
+                    (current_page == PAGE_LIST ||
+                     current_page == PAGE_RELEASES ||
+                     (current_page == PAGE_SEARCH && !search_in_box)))
+                {
+                    download_entry(item_ids[cursor]);
+                    break;
+                }
+                // FALLTHROUGH — typed character into the search box.
 
             default:
                 // Typed alphanumeric: append to query, but only when the
