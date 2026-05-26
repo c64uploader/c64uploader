@@ -110,6 +110,10 @@ void do_releases(const char *category, const char *title, int start);
 void run_myfile(const char *path);
 void download_entry(long id);
 void upload_myfile(const char *path);
+void open_myfile(const char *path);
+void load_menu(const char *path);
+void load_list_path(const char *path, int start);
+void do_search(const char *query, int start);
 static bool is_letter_grid(void);
 void update_letter_grid_cursor(int old_cursor, int new_cursor);
 static void draw_search_input(void);
@@ -169,6 +173,111 @@ static int  releases_return_cursor;
 // When entering a LIST from a menu (including the A-Z letter grid), remember
 // where the cursor was so go_back can put it back rather than snap to item 0.
 static int  menu_return_cursor;
+
+// Reload the current PAGE_LIST/SEARCH/RELEASES at a new offset (called by 'n',
+// 'p', cursor-up at top-of-page, cursor-down at bottom-of-page in those four
+// hotspots). Six different inline copies of this 3-branch dispatch were eating
+// ~150 bytes of binary; helper trims it to one body + a 3-byte call site.
+static void page_reload(int new_offset)
+{
+    if (current_page == PAGE_LIST)
+    {
+        load_list_path(current_category, new_offset);
+        draw_list(current_category);
+    }
+    else if (current_page == PAGE_SEARCH)
+    {
+        do_search(search_query, new_offset);
+        draw_list("assembly64 - search");
+    }
+    else if (current_page == PAGE_RELEASES)
+    {
+        do_releases(releases_category, releases_title, new_offset);
+        draw_releases();
+    }
+}
+
+// True if `p` is a MYFILES sublevel path ("MYFILES/..."). The root path
+// "MYFILES" is NOT a sublevel — it's still shown via MENU as a folder browser
+// (Firmware / Utils / Discmags / ...). Sublevels route through LIST instead,
+// inheriting PAGE_LIST's pagination for arbitrarily large directories.
+static char is_myfiles_sub(const char *p)
+{
+    return p[0]=='M' && p[1]=='Y' && p[2]=='F' && p[3]=='I'
+        && p[4]=='L' && p[5]=='E' && p[6]=='S' && p[7]=='/';
+}
+
+// Switch into PAGE_LIST mode on `path` (used both when entering a MyFiles
+// sublevel from PAGE_CATS and when navigating between MyFiles sublevels via
+// ENTER on a 'D' row in PAGE_LIST).
+static void enter_list_path(const char *path)
+{
+    menu_return_cursor = cursor;
+    strcpy(current_category, path);
+    load_list_path(current_category, 0);
+    current_page = PAGE_LIST;
+    draw_list(current_category);
+}
+
+// Dispatch the cursor entry in PAGE_CATS (called by both ENTER and '>'): MyFiles
+// sublevel folder -> PAGE_LIST (paginated); MyFiles file -> open_myfile;
+// regular folder/dir -> recurse via MENU; list/browse -> PAGE_LIST.
+static void cats_select_cursor(void)
+{
+    char t = menu_types[cursor];
+    if ((t == 'f' || t == 'D') && is_myfiles_sub(menu_paths[cursor]))
+    {
+        enter_list_path(menu_paths[cursor]);
+        return;
+    }
+    if (t == 'f' || t == 'D')
+    {
+        load_menu(menu_paths[cursor]);
+        draw_list(menu_path[0] ? menu_path : "assembly64 - categories");
+        return;
+    }
+    if (t == 'F')
+    {
+        open_myfile(menu_paths[cursor]);
+        return;
+    }
+    enter_list_path(menu_paths[cursor]);
+}
+
+// Build current_category + "/" + item_names[cursor] into `out`. Caller must
+// supply a buffer big enough (80 is the project-wide path budget).
+static void myfile_cursor_path(char *out)
+{
+    sprintf(out, "%s/%s", current_category, item_names[cursor]);
+}
+
+// Dispatch on the cursor entry in a PAGE_LIST view of a MyFiles directory.
+// item_cats[][0] is 'D' for subdirs, anything else for files. `force_upload`
+// makes a file go through UPLOADFILE (no launch) — used by the D key. ENTER
+// passes 0 so files go through open_myfile (run, or upload-only for .ue2).
+// Returns 1 if the caller was in a MyFiles list (action handled); 0 otherwise
+// so the non-MyFiles branches fall through to their normal dispatch.
+static char myfile_list_action(char force_upload)
+{
+    if (!is_myfiles_sub(current_category)) return 0;
+    char p[80];
+    myfile_cursor_path(p);
+    if (item_cats[cursor][0] == 'D')
+    {
+        if (!force_upload) enter_list_path(p);  // D on a dir is a no-op
+    }
+    else if (force_upload)
+    {
+        upload_myfile(p);
+    }
+    else
+    {
+        open_myfile(p);
+    }
+    return 1;
+}
+
+static char enter_myfile_list_item(void) { return myfile_list_action(0); }
 
 // VIC chip at $D000
 #define vic (*(struct VIC *)0xd000)
@@ -472,6 +581,34 @@ int parse_ok_count(void)
     return atoi(p);
 }
 
+// Send `cmd`, ack the response header, and parse "OK <returned> <total>".
+// On either transport failure or an "ERR ..." reply, clears list state and
+// shows the error/status, then returns -1. On success, sets total_count from
+// the second header number (falling back to returned when the server uses the
+// older single-number format), zeros item_count, and returns `returned`.
+// Used by every protocol load: load_menu, load_list_path, do_search,
+// do_releases — collapsing ~120 bytes of duplicated err-handling boilerplate.
+static int load_request(const char *cmd)
+{
+    if (!send_command_safe(cmd))
+    {
+        item_count = 0; total_count = 0; cursor = 0;
+        print_status("server unreachable");
+        return -1;
+    }
+    if (is_error_response())
+    {
+        item_count = 0; total_count = 0; cursor = 0;
+        print_status(line_buffer);
+        return -1;
+    }
+    int n = parse_ok_count();
+    char *spc = strchr(line_buffer + 3, ' ');
+    total_count = spc ? atol(spc + 1) : n;
+    item_count = 0;
+    return n;
+}
+
 // Load menu from server and display it
 // Sets menu_path, item_names, menu_paths, menu_types, item_count
 void load_menu(const char *path)
@@ -492,24 +629,8 @@ void load_menu(const char *path)
     else
         strcpy(cmd, "MENU");
 
-    if (!send_command_safe(cmd))
-    {
-        item_count = 0;
-        total_count = 0;
-        print_status("server unreachable");
+    if (load_request(cmd) < 0)
         return;
-    }
-
-    if (is_error_response())
-    {
-        item_count = 0;
-        total_count = 0;
-        print_status(line_buffer);
-        return;
-    }
-
-    item_count = 0;
-    total_count = parse_ok_count();
 
     // Read menu lines until "."
     // Format: type|name|path|count
@@ -542,15 +663,8 @@ void load_menu(const char *path)
         item_count++;
     }
 
-    // If the server emitted more rows than the cart can buffer (MyFiles
-    // directories can grow without bound), drain to "." so the next protocol
-    // exchange isn't misaligned. Without this the leftover row bytes leak
-    // into the next response and the cart freezes within a few keystrokes.
-    {
-        int safety = 200;
-        while (line_buffer[0] != '.' && safety-- > 0)
-            read_line();
-    }
+    // MyFiles sublevels now route through LIST (paginated) so MENU responses
+    // never exceed MAX_ITEMS in practice — no drain needed.
 
     // Save current path (from our snapshot, since menu_paths[] was rewritten)
     strncpy(menu_path, saved_path, 63);
@@ -598,16 +712,34 @@ void go_back(void)
     }
     else if (current_page == PAGE_LIST)
     {
-        // Entry list -> back to parent menu. menu_path was set by the last
-        // successful load_menu (the parent we came from), so just reload it.
-        // Works whether the list lives directly under that menu (old Browse
-        // A-Z) or one level deeper (new A-Z/letter layout), and avoids the
-        // invalid "MENU Category/Source/A-Z/K" call that would stall the
-        // client because the server has no menu at that leaf path.
-        load_menu(menu_path);
-        if (menu_return_cursor < item_count)
-            cursor = menu_return_cursor;
-        draw_list(menu_path[0] ? menu_path : "assembly64 - categories");
+        if (is_myfiles_sub(current_category))
+        {
+            // MyFiles list -> trim one segment. If we're back at exactly
+            // "MYFILES" (the folder browser root), fall through to MENU mode
+            // (load_menu sets menu_path + current_page); otherwise reload the
+            // parent as another LIST page.
+            trim_path(current_category);
+            if (strcmp(current_category, "MYFILES") == 0)
+            {
+                load_menu(current_category);
+                current_category[0] = 0;
+                draw_list(menu_path);
+            }
+            else
+            {
+                load_list_path(current_category, 0);
+                draw_list(current_category);
+            }
+        }
+        else
+        {
+            // Entry list -> back to parent menu. menu_path was set by the
+            // last successful load_menu (the parent we came from).
+            load_menu(menu_path);
+            if (menu_return_cursor < item_count)
+                cursor = menu_return_cursor;
+            draw_list(menu_path[0] ? menu_path : "assembly64 - categories");
+        }
     }
     else if (current_page == PAGE_CATS)
     {
@@ -634,32 +766,8 @@ void load_list_path(const char *path, int start)
 
     char cmd[96];
     sprintf(cmd, "LISTPATH %d 20 %s", start, path);
-    if (!send_command_safe(cmd))
-    {
-        item_count = 0;
-        total_count = 0;
-        cursor = 0;
-        print_status("server unreachable");
-        return;
-    }
-
-    if (is_error_response())
-    {
-        item_count = 0;
-        total_count = 0;
-        cursor = 0;
-        print_status(line_buffer);
-        return;
-    }
-
-    // Parse "OK n total"
-    char *p = line_buffer + 3;
-    int n = atoi(p);
-    p = strchr(p, ' ');
-    if (p)
-        total_count = atol(p + 1);
-
-    item_count = 0;
+    int n = load_request(cmd);
+    if (n < 0) return;
     offset = start;
 
     // Read entry lines until "."
@@ -795,27 +903,8 @@ void do_search(const char *query, int start)
         sprintf(cmd, "SEARCH %d 20 %s", start, query);
     else
         sprintf(cmd, "SEARCH %d 20 %s %s", start, search_cat_names[search_category], query);
-    if (!send_command_safe(cmd))
-    {
-        item_count = 0;
-        total_count = 0;
-        cursor = 0;
-        print_status("server unreachable");
-        return;
-    }
-    if (is_error_response()) {
-        item_count = 0;
-        total_count = 0;
-        cursor = 0;
-        print_status(line_buffer);
-        return;
-    }
-    char *p = line_buffer + 3;
-    int n = atoi(p);
-    p = strchr(p, ' ');
-    if (p)
-        total_count = atol(p + 1);
-    item_count = 0;
+    int n = load_request(cmd);
+    if (n < 0) return;
     offset = start;
     while (item_count < MAX_ITEMS && item_count < n) {
         read_line();
@@ -857,32 +946,8 @@ void do_releases(const char *category, const char *title, int start)
     char cmd[128];
     sprintf(cmd, "RELEASES %d 20 %s %s", start, category, title);
 
-    if (!send_command_safe(cmd))
-    {
-        item_count = 0;
-        total_count = 0;
-        cursor = 0;
-        print_status("server unreachable");
-        return;
-    }
-
-    if (is_error_response())
-    {
-        item_count = 0;
-        total_count = 0;
-        cursor = 0;
-        print_status(line_buffer);
-        return;
-    }
-
-    // Parse "OK n total"
-    char *p = line_buffer + 3;
-    int n = atoi(p);
-    p = strchr(p, ' ');
-    if (p)
-        total_count = atol(p + 1);
-
-    item_count = 0;
+    int n = load_request(cmd);
+    if (n < 0) return;
     offset = start;
 
     // Read entry lines until "."
@@ -1186,118 +1251,81 @@ char get_key(void)
         if (k == KSCAN_F1) return 'c';  // Open config screen
         if (k == KSCAN_F7) return 0x18;  // Exit (hand off to Ultimate menu)
 
-        // In category menu
-        if (current_page == PAGE_CATS)
+        // Any-key dismiss on the info screen.
+        if (current_page == PAGE_INFO) return 'x';
+
+        // Text-input mode swallows W/S/letter scancodes (they're typed
+        // characters, not navigation): settings editing and search input box.
+        bool in_text_input =
+            (current_page == PAGE_SETTINGS && settings_editing) ||
+            (current_page == PAGE_SEARCH && search_in_box);
+
+        // Cursor-down (with optional shift) is always nav, on every page.
+        if (k == KSCAN_CSR_DOWN && shift) return 'u';
+        if (k == KSCAN_CSR_DOWN) return 'd';
+
+        // W / S are nav only outside text-input contexts.
+        if (!in_text_input)
         {
-            if (is_letter_grid())
-            {
-                // Grid mode: cursor right/left navigate the grid instead of
-                // entering a folder / going back. Back still works via DEL.
-                if (k == KSCAN_W || (k == KSCAN_CSR_DOWN && shift)) return 'u';
-                if (k == KSCAN_S || k == KSCAN_CSR_DOWN) return 'd';
-                if (k == KSCAN_CSR_RIGHT && !shift) return 'r';
-                if (k == KSCAN_CSR_RIGHT && shift) return 'l';
-                if (k == KSCAN_A) return 'l';
-                if (k == KSCAN_D) return 'r';
-                if (k == KSCAN_SLASH) return '/';
-            }
-            else
-            {
-                // F1 (config) / F7 (exit) are handled globally above; no
-                // letter shortcuts at this level.
-                if (k == KSCAN_W) return 'u';
-                if (k == KSCAN_CSR_DOWN && shift) return 'u';
-                if (k == KSCAN_S || k == KSCAN_CSR_DOWN) return 'd';
-                if (k == KSCAN_SLASH) return '/';
-                if (k == KSCAN_CSR_RIGHT && !shift) return '>';  // Right = enter category
-                if (k == KSCAN_CSR_RIGHT && shift) return 8;  // Left = back
-                // D = upload-only on a MyFiles file. Main switch ignores it
-                // for folders/categories so we can return it unconditionally.
-                if (k == KSCAN_D) return 'D';
-            }
+            if (k == KSCAN_W) return 'u';
+            if (k == KSCAN_S) return 'd';
         }
-        // In list view
-        else if (current_page == PAGE_LIST)
+
+        // Letter-grid (PAGE_CATS A-Z picker) has its own right/left convention.
+        bool grid = (current_page == PAGE_CATS && is_letter_grid());
+        if (grid)
         {
-            if (k == KSCAN_W || (k == KSCAN_CSR_DOWN && shift)) return 'u';
-            if (k == KSCAN_S || k == KSCAN_CSR_DOWN) return 'd';
+            if (k == KSCAN_CSR_RIGHT) return shift ? 'l' : 'r';
+            if (k == KSCAN_A) return 'l';
+            if (k == KSCAN_D) return 'r';
+            if (k == KSCAN_SLASH) return '/';
+        }
+        else if (k == KSCAN_CSR_RIGHT)
+        {
+            // Right-arrow: '>' to descend in PAGE_CATS/LIST/RELEASES, or
+            // '\r' in PAGE_SEARCH result list (treat right as ENTER on a
+            // result). Shift-right is always "back".
+            if (shift) return 8;
+            if (current_page == PAGE_SEARCH && !search_in_box) return '\r';
+            return '>';
+        }
+
+        // List-style pages share N/P/I/D shortcuts.
+        bool list_like = (current_page == PAGE_LIST || current_page == PAGE_RELEASES ||
+                          (current_page == PAGE_SEARCH && !search_in_box && item_count > 0));
+        if (list_like)
+        {
             if (k == KSCAN_N) return 'n';
             if (k == KSCAN_P) return 'p';
-            if (k == KSCAN_I) return 'i';  // Info
-            if (k == KSCAN_D) return 'D';  // Download entry to /Temp (no launch)
-            if (k == KSCAN_CSR_RIGHT && !shift) return '>';  // Right = releases
-            if (k == KSCAN_CSR_RIGHT && shift) return 8;  // Left = back
+            if (k == KSCAN_I) return 'i';
+            if (k == KSCAN_D) return 'D';
         }
-        // In the config page (server / port / autostart / connect / save).
-        else if (current_page == PAGE_SETTINGS)
+
+        // PAGE_CATS (non-grid): SLASH opens search; D acts on a MyFiles file.
+        if (current_page == PAGE_CATS && !grid)
         {
-            if (!settings_editing)
-            {
-                if (k == KSCAN_W || (k == KSCAN_CSR_DOWN && shift)) return 'u';
-                if (k == KSCAN_S || k == KSCAN_CSR_DOWN) return 'd';
-            }
-            else
-            {
-                // Editing — digits and '.' for both SERVER (IP/host) and
-                // PORT (decimal) fields.
-                if (k < 64)
-                {
-                    byte c = (byte)keyb_codes[shift ? k + 64 : k];
-                    if (c >= '0' && c <= '9') return c;
-                    if (c == '.') return '.';
-                }
-            }
+            if (k == KSCAN_SLASH) return '/';
+            if (k == KSCAN_D) return 'D';
         }
-        // In simple search. The active region (input box vs result list)
-        // determines whether letter scancodes are typing-input or nav
-        // shortcuts. Cursor-keys are always nav (no character ambiguity);
-        // letters W/S/N/P/I are nav ONLY in the result list, otherwise
-        // they're appended to the query.
-        else if (current_page == PAGE_SEARCH)
+
+        // PAGE_SEARCH always lets C= cycle the category filter.
+        if (current_page == PAGE_SEARCH && k == 0x0F) return '\t';
+
+        // Settings editing — digits and '.' for SERVER (IP/host) / PORT.
+        if (current_page == PAGE_SETTINGS && settings_editing && k < 64)
         {
-            if (k == KSCAN_CSR_RIGHT && shift) return 8;  // Left = back
-            if (k == 0x0F) return '\t';  // C= = cycle category
-            if (search_in_box)
-            {
-                // Cursor-up/down only — leave letters for typing.
-                if (k == KSCAN_CSR_DOWN && shift) return 'u';
-                if (k == KSCAN_CSR_DOWN) return 'd';
-            }
-            else if (item_count > 0)
-            {
-                if (k == KSCAN_W || (k == KSCAN_CSR_DOWN && shift)) return 'u';
-                if (k == KSCAN_S || k == KSCAN_CSR_DOWN) return 'd';
-                if (k == KSCAN_N) return 'n';
-                if (k == KSCAN_P) return 'p';
-                if (k == KSCAN_I) return 'i';
-                if (k == KSCAN_D) return 'D';  // Download entry to /Temp (no launch)
-                if (k == KSCAN_CSR_RIGHT && !shift) return '\r';
-            }
-            // Letter / digit / space fallthrough: typed character. Space
-            // matters for multi-word queries ("the new"), so it's allowed
-            // through here and at the append-to-query default-case below.
-            if (k < 64) {
-                byte c = (byte)keyb_codes[shift ? k + 64 : k];
-                if (c >= 'a' && c <= 'z') return c - 32;
-                if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return c;
-                if (c == ' ') return ' ';
-            }
+            byte c = (byte)keyb_codes[shift ? k + 64 : k];
+            if (c >= '0' && c <= '9') return c;
+            if (c == '.') return '.';
         }
-        // In releases page
-        else if (current_page == PAGE_RELEASES)
+
+        // Search input box — typed letters/digits/space build the query.
+        if (current_page == PAGE_SEARCH && search_in_box && k < 64)
         {
-            if (k == KSCAN_W || (k == KSCAN_CSR_DOWN && shift)) return 'u';
-            if (k == KSCAN_S || k == KSCAN_CSR_DOWN) return 'd';
-            if (k == KSCAN_N) return 'n';
-            if (k == KSCAN_P) return 'p';
-            if (k == KSCAN_I) return 'i';  // Info
-            if (k == KSCAN_D) return 'D';  // Download release to /Temp (no launch)
-            if (k == KSCAN_CSR_RIGHT && shift) return 8;  // Left = back
-        }
-        // In info screen - any key returns
-        else if (current_page == PAGE_INFO)
-        {
-            return 'x';  // Any key = exit info
+            byte c = (byte)keyb_codes[shift ? k + 64 : k];
+            if (c >= 'a' && c <= 'z') return c - 32;
+            if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return c;
+            if (c == ' ') return ' ';
         }
     }
     return 0;
@@ -1904,10 +1932,9 @@ int main(void)
                     {
                         int new_offset = offset - 20;
                         if (new_offset < 0) new_offset = 0;
-                        do_search(search_query, new_offset);
+                        page_reload(new_offset);
                         cursor = item_count - 1;
                         if (cursor > LIST_HEIGHT - 1) cursor = LIST_HEIGHT - 1;
-                        draw_list("assembly64 - search");
                     }
                     else
                     {
@@ -1928,10 +1955,9 @@ int main(void)
                     {
                         int new_offset = offset - 20;
                         if (new_offset < 0) new_offset = 0;
-                        do_releases(releases_category, releases_title, new_offset);
+                        page_reload(new_offset);
                         cursor = item_count - 1;
-                        if (cursor > 18) cursor = 18;
-                        draw_releases();
+                        if (cursor > LIST_HEIGHT - 1) cursor = LIST_HEIGHT - 1;
                     }
                 }
                 else if (current_page == PAGE_LIST)
@@ -1947,10 +1973,9 @@ int main(void)
                         // At top of list, go to previous page
                         int new_offset = offset - 20;
                         if (new_offset < 0) new_offset = 0;
-                        load_list_path(current_category, new_offset);
+                        page_reload(new_offset);
                         cursor = item_count - 1;
                         if (cursor > LIST_HEIGHT - 1) cursor = LIST_HEIGHT - 1;
-                        draw_list(current_category);
                     }
                 }
                 else if (current_page == PAGE_CATS && is_letter_grid())
@@ -1996,8 +2021,7 @@ int main(void)
                 }
                 else if (current_page == PAGE_SEARCH)
                 {
-                    int max_visible = LIST_HEIGHT - 1;
-                    if (cursor < item_count - 1 && cursor < max_visible)
+                    if (cursor < item_count - 1 && cursor < LIST_HEIGHT - 1)
                     {
                         int old = cursor;
                         cursor++;
@@ -2005,15 +2029,13 @@ int main(void)
                     }
                     else if (offset + item_count < total_count)
                     {
-                        do_search(search_query, offset + 20);
+                        page_reload(offset + 20);
                         cursor = 0;
-                        draw_list("assembly64 - search");
                     }
                 }
                 else if (current_page == PAGE_RELEASES)
                 {
-                    int max_visible = 18;
-                    if (cursor < item_count - 1 && cursor < max_visible)
+                    if (cursor < item_count - 1 && cursor < LIST_HEIGHT - 1)
                     {
                         int old = cursor;
                         cursor++;
@@ -2021,16 +2043,13 @@ int main(void)
                     }
                     else if (offset + item_count < total_count)
                     {
-                        do_releases(releases_category, releases_title, offset + 20);
+                        page_reload(offset + 20);
                         cursor = 0;
-                        draw_releases();
                     }
                 }
                 else if (current_page == PAGE_LIST)
                 {
-                    // Max visible is LIST_HEIGHT - 1 (0 to 17 for 18 items)
-                    int max_visible = LIST_HEIGHT - 1;
-                    if (cursor < item_count - 1 && cursor < max_visible)
+                    if (cursor < item_count - 1 && cursor < LIST_HEIGHT - 1)
                     {
                         int old = cursor;
                         cursor++;
@@ -2038,10 +2057,8 @@ int main(void)
                     }
                     else if (offset + item_count < total_count)
                     {
-                        // At bottom, go to next page
-                        load_list_path(current_category, offset + 20);
+                        page_reload(offset + 20);
                         cursor = 0;
-                        draw_list(current_category);
                     }
                 }
                 else if (current_page == PAGE_CATS && is_letter_grid())
@@ -2105,32 +2122,17 @@ int main(void)
             case '>':  // Right arrow - enter menu item or releases
                 if (current_page == PAGE_CATS && item_count > 0)
                 {
-                    if (menu_types[cursor] == 'f' || menu_types[cursor] == 'D')
-                    {
-                        // Folder or Directory - navigate into it
-                        load_menu(menu_paths[cursor]);
-                        draw_list(item_names[0] ? menu_path : "assembly64");
-                    }
-                    else if (menu_types[cursor] == 'F')
-                    {
-                        // File in MYFILES - run it, or upload-only for firmware (.ue2).
-                        open_myfile(menu_paths[cursor]);
-                    }
-                    else
-                    {
-                        // List or Browse (type 'l' or 'b') - load entries
-                        menu_return_cursor = cursor;
-                        strcpy(current_category, menu_paths[cursor]);
-                        load_list_path(current_category, 0);
-                        current_page = PAGE_LIST;
-                        draw_list(current_category);
-                    }
+                    cats_select_cursor();
                 }
                 else if (current_page == PAGE_LIST && item_count > 0)
                 {
-                    // Enter releases sub-list if count > 1
-                    if (item_counts[cursor] > 1)
+                    if (enter_myfile_list_item())
                     {
+                        // MyFiles dispatch handled
+                    }
+                    else if (item_counts[cursor] > 1)
+                    {
+                        // Enter releases sub-list if count > 1
                         strncpy(releases_title, item_names[cursor], 31);
                         releases_title[31] = 0;
                         strncpy(releases_category, current_category, 47);
@@ -2153,27 +2155,7 @@ int main(void)
             case '\r':  // Enter
                 if (current_page == PAGE_CATS && item_count > 0)
                 {
-                    // Select menu item
-                    if (menu_types[cursor] == 'f' || menu_types[cursor] == 'D')
-                    {
-                        // Folder or Directory - navigate into it
-                        load_menu(menu_paths[cursor]);
-                        draw_list(menu_path[0] ? menu_path : "assembly64 - categories");
-                    }
-                    else if (menu_types[cursor] == 'F')
-                    {
-                        // File in MYFILES - run it, or upload-only for firmware (.ue2).
-                        open_myfile(menu_paths[cursor]);
-                    }
-                    else
-                    {
-                        // List or Browse (type 'l' or 'b') - load entries
-                        menu_return_cursor = cursor;
-                        strcpy(current_category, menu_paths[cursor]);
-                        load_list_path(current_category, 0);
-                        current_page = PAGE_LIST;
-                        draw_list(current_category);
-                    }
+                    cats_select_cursor();
                 }
                 else if (current_page == PAGE_SETTINGS)
                 {
@@ -2243,15 +2225,15 @@ int main(void)
                         draw_list("assembly64 - search");
                     }
                 }
-                else if (current_page == PAGE_RELEASES && item_count > 0)
+                else if (item_count > 0 &&
+                         (current_page == PAGE_LIST ||
+                          current_page == PAGE_RELEASES ||
+                          current_page == PAGE_SEARCH))
                 {
-                    // Run selected release
-                    run_entry(item_ids[cursor]);
-                }
-                else if (item_count > 0)
-                {
-                    // Run entry (PAGE_LIST or PAGE_SEARCH-result-list)
-                    run_entry(item_ids[cursor]);
+                    // MyFiles list entry routes to run/upload (no Assembly64
+                    // entry id); otherwise launch the entry by id.
+                    if (current_page != PAGE_LIST || !enter_myfile_list_item())
+                        run_entry(item_ids[cursor]);
                 }
                 break;
 
@@ -2371,44 +2353,22 @@ int main(void)
                 break;
 
             case 'n':  // Next page
-                if (current_page == PAGE_LIST && offset + item_count < total_count)
+                if ((current_page == PAGE_LIST || current_page == PAGE_SEARCH ||
+                     current_page == PAGE_RELEASES) &&
+                    offset + item_count < total_count)
                 {
-                    load_list_path(current_category, offset + 20);
-                    draw_list(current_category);
-                }
-                else if (current_page == PAGE_SEARCH && offset + item_count < total_count)
-                {
-                    do_search(search_query, offset + 20);
-                    draw_list("assembly64 - search");
-                }
-                else if (current_page == PAGE_RELEASES && offset + item_count < total_count)
-                {
-                    do_releases(releases_category, releases_title, offset + 20);
-                    draw_releases();
+                    page_reload(offset + 20);
                 }
                 break;
 
             case 'p':  // Previous page
-                if (current_page == PAGE_LIST && offset > 0)
+                if ((current_page == PAGE_LIST || current_page == PAGE_SEARCH ||
+                     current_page == PAGE_RELEASES) &&
+                    offset > 0)
                 {
                     int new_offset = offset - 20;
                     if (new_offset < 0) new_offset = 0;
-                    load_list_path(current_category, new_offset);
-                    draw_list(current_category);
-                }
-                else if (current_page == PAGE_SEARCH && offset > 0)
-                {
-                    int new_offset = offset - 20;
-                    if (new_offset < 0) new_offset = 0;
-                    do_search(search_query, new_offset);
-                    draw_list("assembly64 - search");
-                }
-                else if (current_page == PAGE_RELEASES && offset > 0)
-                {
-                    int new_offset = offset - 20;
-                    if (new_offset < 0) new_offset = 0;
-                    do_releases(releases_category, releases_title, new_offset);
-                    draw_releases();
+                    page_reload(new_offset);
                 }
                 break;
 
@@ -2459,7 +2419,8 @@ int main(void)
                      current_page == PAGE_RELEASES ||
                      (current_page == PAGE_SEARCH && !search_in_box)))
                 {
-                    download_entry(item_ids[cursor]);
+                    if (current_page != PAGE_LIST || !myfile_list_action(1))
+                        download_entry(item_ids[cursor]);
                     break;
                 }
                 // FALLTHROUGH — typed character into the search box.
