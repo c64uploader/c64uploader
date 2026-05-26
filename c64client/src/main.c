@@ -424,10 +424,44 @@ void send_command(const char *cmd)
     uci_socket_write_char(socket_id, '\n');
 }
 
-// Read a line from server, returns length
+// Read a line from server, returns true on success.
 int read_line(void)
 {
     return uci_tcp_nextline(socket_id, line_buffer, sizeof(line_buffer));
+}
+
+// Send a command and read the first response line, transparently reconnecting
+// and re-issuing the command once if the connection has been torn down (server
+// idle timeout, network drop, cart suspended for a long time, etc).
+//
+// Returns true if line_buffer holds the server's reply. Returns false only if
+// the reconnect itself fails or the re-issued command still doesn't get a
+// response; in that case the caller should treat the operation as failed.
+//
+// Only the FIRST read after a command is auto-retried. If a caller is reading
+// trailing rows of a multi-line response and a mid-stream read fails, that's
+// a different kind of error and the caller should bail with a status message
+// — reissuing the original command would just re-send rows the caller already
+// processed.
+int send_command_safe(const char *cmd)
+{
+    if (connected)
+    {
+        send_command(cmd);
+        if (read_line())
+            return 1;
+        // Drop the now-dead socket so connect_to_server doesn't try to close
+        // an already-closed fd and confuse the firmware.
+        uci_socket_close(socket_id);
+        connected = false;
+    }
+
+    print_status("reconnecting...");
+    if (!connect_to_server())
+        return 0;
+
+    send_command(cmd);
+    return read_line();
 }
 
 // Parse "OK n total" response, returns n
@@ -458,8 +492,13 @@ void load_menu(const char *path)
     else
         strcpy(cmd, "MENU");
 
-    send_command(cmd);
-    read_line();  // "OK n"
+    if (!send_command_safe(cmd))
+    {
+        item_count = 0;
+        total_count = 0;
+        print_status("server unreachable");
+        return;
+    }
 
     if (is_error_response())
     {
@@ -585,8 +624,14 @@ void load_list_path(const char *path, int start)
 
     char cmd[96];
     sprintf(cmd, "LISTPATH %d 20 %s", start, path);
-    send_command(cmd);
-    read_line();  // "OK n total"
+    if (!send_command_safe(cmd))
+    {
+        item_count = 0;
+        total_count = 0;
+        cursor = 0;
+        print_status("server unreachable");
+        return;
+    }
 
     if (is_error_response())
     {
@@ -652,10 +697,12 @@ void run_entry(long id)
 
     char cmd[32];
     sprintf(cmd, "RUN %ld", id);
-    send_command(cmd);
-
-    read_line();  // "OK Running xxx" or "ERR xxx"
-    print_status(line_buffer);
+    if (!send_command_safe(cmd))
+    {
+        print_status("server unreachable");
+        return;
+    }
+    print_status(line_buffer);  // "OK Running xxx" or "ERR xxx"
 }
 
 // Run file from MYFILES directory
@@ -665,10 +712,12 @@ void run_myfile(const char *path)
 
     char cmd[64];
     sprintf(cmd, "RUNFILE %s", path);
-    send_command(cmd);
-
-    read_line();  // "OK Running xxx" or "ERR xxx"
-    print_status(line_buffer);
+    if (!send_command_safe(cmd))
+    {
+        print_status("server unreachable");
+        return;
+    }
+    print_status(line_buffer);  // "OK Running xxx" or "ERR xxx"
 }
 
 // Save selected Assembly64 entry's primary file to the device's /Temp via FTP
@@ -679,10 +728,12 @@ void download_entry(long id)
 
     char cmd[32];
     sprintf(cmd, "DOWNLOAD %ld", id);
-    send_command(cmd);
-
-    read_line();  // "OK Saved /Temp/xxx" or "ERR xxx"
-    print_status(line_buffer);
+    if (!send_command_safe(cmd))
+    {
+        print_status("server unreachable");
+        return;
+    }
+    print_status(line_buffer);  // "OK Saved /Temp/xxx" or "ERR xxx"
 }
 
 // True if name ends in ".ue2" (case-insensitive). Ultimate firmware/flash-patch
@@ -706,10 +757,12 @@ void upload_myfile(const char *path)
 
     char cmd[64];
     sprintf(cmd, "UPLOADFILE %s", path);
-    send_command(cmd);
-
-    read_line();  // "OK Uploaded /Temp/xxx" or "ERR xxx"
-    print_status(line_buffer);
+    if (!send_command_safe(cmd))
+    {
+        print_status("server unreachable");
+        return;
+    }
+    print_status(line_buffer);  // "OK Uploaded /Temp/xxx" or "ERR xxx"
 }
 
 // Open a selected MYFILES file: firmware (.ue2) is uploaded only, anything else is run.
@@ -732,8 +785,14 @@ void do_search(const char *query, int start)
         sprintf(cmd, "SEARCH %d 20 %s", start, query);
     else
         sprintf(cmd, "SEARCH %d 20 %s %s", start, search_cat_names[search_category], query);
-    send_command(cmd);
-    read_line();
+    if (!send_command_safe(cmd))
+    {
+        item_count = 0;
+        total_count = 0;
+        cursor = 0;
+        print_status("server unreachable");
+        return;
+    }
     if (is_error_response()) {
         item_count = 0;
         total_count = 0;
@@ -788,8 +847,14 @@ void do_releases(const char *category, const char *title, int start)
     char cmd[128];
     sprintf(cmd, "RELEASES %d 20 %s %s", start, category, title);
 
-    send_command(cmd);
-    read_line();  // "OK n total"
+    if (!send_command_safe(cmd))
+    {
+        item_count = 0;
+        total_count = 0;
+        cursor = 0;
+        print_status("server unreachable");
+        return;
+    }
 
     if (is_error_response())
     {
@@ -883,8 +948,11 @@ bool fetch_info(long id)
 
     char cmd[32];
     sprintf(cmd, "INFO %ld", id);
-    send_command(cmd);
-    read_line();  // "OK" or "ERR ..."
+    if (!send_command_safe(cmd))
+    {
+        print_status("server unreachable");
+        return false;
+    }
 
     if (line_buffer[0] == 'E')
     {

@@ -18,7 +18,18 @@ import (
 )
 
 const (
-	c64ReadTimeout = 5 * time.Minute
+	// c64ReadTimeout caps how long the server waits for the next command on an
+	// idle connection. The cart is interactive — a human can easily sit on a
+	// menu for an hour reading; anything short forces the client to detect a
+	// silently-closed socket and reconnect mid-browse. Genuinely dead clients
+	// are caught by TCP keepalive (see SetKeepAlivePeriod below) rather than by
+	// this application-level deadline.
+	c64ReadTimeout = 24 * time.Hour
+	// c64KeepAlivePeriod is how often the kernel sends a TCP keepalive probe
+	// after a connection has been idle. With Linux's default 9 probes before
+	// declaring the peer dead, this gives a ~10-minute window to clean up
+	// clients whose machine vanished without sending a FIN.
+	c64KeepAlivePeriod = 60 * time.Second
 )
 
 // StartC64ServerSQLite starts the C64 protocol server with SQLite backend.
@@ -47,6 +58,15 @@ func StartC64ServerSQLite(port int, sqliteServer *SQLiteServer, apiClient *APICl
 
 func handleC64ConnectionSQLite(conn net.Conn, server *SQLiteServer, apiClient *APIClient, assembly64Path string) {
 	defer conn.Close()
+
+	// Enable TCP keepalive so clients that vanished without sending a FIN
+	// (cart power-off, network drop, NAT translation expiry) get cleaned up
+	// by the kernel rather than sitting around until c64ReadTimeout, which
+	// is intentionally generous for interactive use.
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(c64KeepAlivePeriod)
+	}
 
 	remoteAddr := conn.RemoteAddr().String()
 	slog.Info("C64 client connected", "remote", remoteAddr)
