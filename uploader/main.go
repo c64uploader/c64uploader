@@ -397,6 +397,7 @@ func runServer(args []string) {
 	host := fs.String("host", "c64u", "C64 Ultimate hostname or IP address")
 	verbose := fs.Bool("v", false, "Enable verbose debug logging")
 	assembly64Path := fs.String("assembly64", "~/Downloads/assembly64", "Path to Assembly64 data directory")
+	myfilesPath := fs.String("myfiles", "", "Path to the My Files directory exposed to the C64 client (default: <assembly64>/Myfiles)")
 	port := fs.Int("port", 6465, "C64 protocol server port")
 	spiffyPort := fs.Int("spiffy-http-port", 0, "Spiffy-compatible HTTP API port (0 = disabled). Lets the Ultimate firmware's built-in Assembly64 browser use this server as its upstream.")
 	spiffyClientID := fs.String("spiffy-client-id", "", "Optional Client-Id header value the Spiffy HTTP server requires (default: unauthenticated).")
@@ -415,6 +416,16 @@ func runServer(args []string) {
 		a64Path = filepath.Join(home, a64Path[2:])
 	}
 
+	// Resolve the My Files directory: explicit -myfiles wins, otherwise default
+	// to <assembly64>/Myfiles so a single -assembly64 flag covers the common case.
+	mfPath := *myfilesPath
+	if mfPath == "" {
+		mfPath = filepath.Join(a64Path, "Myfiles")
+	} else if strings.HasPrefix(mfPath, "~/") {
+		home, _ := os.UserHomeDir()
+		mfPath = filepath.Join(home, mfPath[2:])
+	}
+
 	// Check if SQLite database exists.
 	dbPath := filepath.Join(a64Path, "c64uploader.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -430,7 +441,7 @@ func runServer(args []string) {
 	slog.Info("Using SQLite database", "path", dbPath)
 	fmt.Printf("Using SQLite database: %s\n", dbPath)
 
-	sqliteServer, err := NewSQLiteServer(dbPath, a64Path)
+	sqliteServer, err := NewSQLiteServer(dbPath, a64Path, mfPath)
 	if err != nil {
 		slog.Error("Failed to open SQLite database", "error", err)
 		os.Exit(1)

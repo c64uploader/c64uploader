@@ -128,10 +128,11 @@ Upload a file to C64 Ultimate via FTP from a local path or remote URL:
 
 This is also how Ultimate firmware/flash-patch files (`.ue2`) get onto the device.
 The native C64 client handles this for you: `.ue2` files placed in the server's
-`myfiles/` directory appear under **My Files** in the browser, and selecting one
-transfers it to `/Temp` via FTP **without launching** (there is no firmware-flash
-REST endpoint — apply the patch from the Ultimate's on-device menu afterward). See
-[c64client/README.md](c64client/README.md#running-programs).
+My Files directory (configured by `-myfiles`, defaulting to `<assembly64>/Myfiles`
+— e.g. `<assembly64>/Myfiles/Firmware/`) appear under **My Files** in the browser,
+and selecting one transfers it to `/Temp` via FTP **without launching** (there is
+no firmware-flash REST endpoint — apply the patch from the Ultimate's on-device
+menu afterward). See [c64client/README.md](c64client/README.md#running-programs).
 
 ### Poke Mode
 
@@ -168,18 +169,20 @@ Start the C64 protocol server for the C64 client:
 - `-host <ip>` - C64 Ultimate hostname or IP address (default: `c64u`)
 - `-db <path>` - Path to SQLite database file (default: `c64uploader.db` in assembly64 directory)
 - `-assembly64 <path>` - Path to Assembly64 collection (default: `~/Downloads/assembly64`)
+- `-myfiles <path>` - Path to the My Files directory exposed to the C64 client's **My Files** browser (default: `<assembly64>/Myfiles`). `~/` is expanded. Subdirectories are walked when the user navigates into them — e.g. drop `.ue2` firmware patches in `<assembly64>/Myfiles/Firmware/` to see them there.
 - `-port <port>` - C64 protocol server port (default: `6465`)
 - `-spiffy-http-port <port>` - Spiffy-compatible HTTP API port (default: `0` = disabled). When set, a second listener on this port serves the same `/leet/search/` REST API the Ultimate firmware's built-in Assembly64 browser expects, backed by our SQLite index. Lets the stock firmware browser use this server as its upstream — no custom C64 cart needed. See `uploader/SPIFFY_HTTP_API.md` for the wire format.
 - `-spiffy-client-id <value>` - Optional `Client-Id` header value the Spiffy listener requires (default: empty = unauthenticated).
-- `-reindex-interval <duration>` - Poll the Assembly64 directory this often and hot-swap a freshly rebuilt database when files are added or changed (default: `0` = disabled, e.g. `10m`). NFS-friendly: it polls directory mtimes rather than relying on inotify (which doesn't see changes made on an NFS server or by other clients). On a detected change it rebuilds the index in the background and swaps it in atomically — no restart, no downtime. Detects new release folders and new files inside existing folders; in-place edits of an existing file's contents are not detected. Seeds its baseline at startup, so it reacts to changes made while running (regenerate manually with `sqlitegen` for changes made while the server was down).
+- `-reindex-interval <duration>` - Poll the Assembly64 directory this often and hot-swap a freshly rebuilt database when files are added or changed (default: `0` = disabled, e.g. `1h`). NFS-friendly: it polls directory mtimes rather than relying on inotify (which doesn't see changes made on an NFS server or by other clients). On a detected change it rebuilds the index in the background and swaps it in atomically — no restart, no downtime. Detects new release folders and new files inside existing folders; in-place edits of an existing file's contents are not detected. The server also rebuilds the index **once at startup** when this flag is set, so changes made while the server was down are picked up without needing a separate `sqlitegen` run; pick an interval based on how often new files land while the server is running.
 - `-v` - Enable verbose debug logging
 
 **Example:**
 ```bash
 ./c64uploader server -host 192.168.2.100 -assembly64 ~/assembly64 -port 6465 -spiffy-http-port 8000
 
-# Auto-pick up files added to an NFS-mounted collection every 10 minutes
-./c64uploader server -assembly64 /nas/Retro/Assembly64 -reindex-interval 10m
+# Auto-pick up files added to an NFS-mounted collection. The server rebuilds the
+# index once at startup, then polls hourly for additions made while it's running.
+./c64uploader server -assembly64 /nas/Retro/Assembly64 -reindex-interval 1h
 ```
 
 The C64 protocol is a simple line-based protocol optimized for low-bandwidth C64 communication.

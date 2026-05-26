@@ -179,10 +179,10 @@ func handleC64CommandSQLite(line string, server *SQLiteServer, apiClient *APICli
 		}
 		// Extract relative path after MYFILES/
 		relPath := strings.TrimPrefix(myPath, "MYFILES/")
-		filePath := filepath.Join("./myfiles", relPath)
+		filePath := filepath.Join(server.myfilesPath, relPath)
 
 		// Security: Prevent path traversal attacks
-		absBase, err := filepath.Abs("./myfiles")
+		absBase, err := filepath.Abs(server.myfilesPath)
 		if err != nil {
 			return "ERR Internal error\n"
 		}
@@ -232,10 +232,10 @@ func handleC64CommandSQLite(line string, server *SQLiteServer, apiClient *APICli
 		}
 		// Extract relative path after MYFILES/
 		relPath := strings.TrimPrefix(myPath, "MYFILES/")
-		filePath := filepath.Join("./myfiles", relPath)
+		filePath := filepath.Join(server.myfilesPath, relPath)
 
 		// Security: Prevent path traversal attacks
-		absBase, err := filepath.Abs("./myfiles")
+		absBase, err := filepath.Abs(server.myfilesPath)
 		if err != nil {
 			return "ERR Internal error\n"
 		}
@@ -321,6 +321,7 @@ type SQLiteServer struct {
 	// restart. Always read it via DB().
 	db             atomic.Pointer[DB]
 	assembly64Path string
+	myfilesPath    string
 	reindexMu      sync.Mutex // ensures at most one reindex runs at a time
 }
 
@@ -330,20 +331,22 @@ func (s *SQLiteServer) DB() *DB {
 }
 
 // NewSQLiteServer creates a new SQLite-based server.
-func NewSQLiteServer(dbPath, assembly64Path string) (*SQLiteServer, error) {
+func NewSQLiteServer(dbPath, assembly64Path, myfilesPath string) (*SQLiteServer, error) {
 	db, err := OpenDB(dbPath)
 	if err != nil {
 		return nil, err
 	}
 
-	// Ensure myfiles directory exists for user content
-	if err := os.MkdirAll("./myfiles", 0755); err != nil {
-		slog.Warn("Could not create myfiles directory", "error", err)
+	// Ensure the My Files directory exists. Best-effort: the default is inside
+	// the Assembly64 collection which may live on read-only NFS; an existing
+	// dir makes this a no-op.
+	if err := os.MkdirAll(myfilesPath, 0755); err != nil {
+		slog.Warn("Could not create myfiles directory", "path", myfilesPath, "error", err)
 	} else {
-		slog.Debug("myfiles directory ready")
+		slog.Debug("myfiles directory ready", "path", myfilesPath)
 	}
 
-	s := &SQLiteServer{assembly64Path: assembly64Path}
+	s := &SQLiteServer{assembly64Path: assembly64Path, myfilesPath: myfilesPath}
 	s.db.Store(db)
 	return s, nil
 }
@@ -436,15 +439,26 @@ func (s *SQLiteServer) reindex(assembly64Path, dbPath string) error {
 	return nil
 }
 
-// autoReindexLoop periodically checks the Assembly64 directory for added or
-// changed files and, when it detects a change, rebuilds and hot-swaps the DB.
-// Intended to run in its own goroutine for the server's lifetime.
+// autoReindexLoop rebuilds the DB once at startup (so changes that landed while
+// the server was down are picked up immediately) and then periodically polls the
+// Assembly64 directory and hot-swaps a fresh DB when it detects added or changed
+// files. Intended to run in its own goroutine for the server's lifetime.
 func (s *SQLiteServer) autoReindexLoop(interval time.Duration, assembly64Path, dbPath string) {
+	slog.Info("auto-reindex enabled", "interval", interval)
+
+	// Startup rebuild. Without this the loop's initial signature would be
+	// derived from the current filesystem and any pre-existing drift between
+	// the on-disk DB and the tree would never trigger a rebuild.
+	if err := s.reindex(assembly64Path, dbPath); err != nil {
+		slog.Error("auto-reindex: startup rebuild failed", "error", err)
+	} else {
+		slog.Info("auto-reindex: startup rebuild complete")
+	}
+
 	last, err := scanSignature(assembly64Path)
 	if err != nil {
 		slog.Warn("auto-reindex: initial scan failed", "error", err)
 	}
-	slog.Info("auto-reindex enabled", "interval", interval, "dirs", last.dirCount)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -1363,17 +1377,17 @@ func (s *SQLiteServer) GetFilePath(id int64) (string, error) {
 }
 
 // getMyFilesMenu returns directory listing for the MYFILES path.
-// MYFILES paths map to ./myfiles/ on the filesystem.
+// MYFILES paths map to the configured myfiles directory on the filesystem
+// (set via -myfiles, defaulting to <assembly64>/Myfiles).
 func (s *SQLiteServer) getMyFilesMenu(parts []string) string {
-	// Build path: ./myfiles/ + subdirectory
 	subPath := ""
 	if len(parts) > 1 {
 		subPath = strings.Join(parts[1:], "/")
 	}
-	dirPath := filepath.Join("./myfiles", subPath)
+	dirPath := filepath.Join(s.myfilesPath, subPath)
 
 	// Security: Prevent path traversal attacks by validating resolved path
-	absBase, err := filepath.Abs("./myfiles")
+	absBase, err := filepath.Abs(s.myfilesPath)
 	if err != nil {
 		slog.Error("getMyFilesMenu: failed to resolve base path", "error", err)
 		return "OK 0\n.\n"
