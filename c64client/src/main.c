@@ -2056,8 +2056,14 @@ int main(void)
                         update_letter_grid_cursor(old, cursor);
                     }
                 }
-                else if (cursor < item_count - 1)
+                else if (cursor < item_count - 1 && cursor < LIST_HEIGHT - 1)
                 {
+                    // PAGE_CATS only draws the first LIST_HEIGHT entries
+                    // (draw_list loops i < LIST_HEIGHT). Letting the cursor
+                    // run past row LIST_HEIGHT-1 sends draw_item_at writes
+                    // off-screen into BASIC RAM and wedges the cart, which
+                    // happens the first time a MyFiles folder holds more
+                    // entries than fit on one screen.
                     int old = cursor;
                     cursor++;
                     update_cursor(old, cursor);
