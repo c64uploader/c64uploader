@@ -68,8 +68,20 @@ func handleC64ConnectionSQLite(conn net.Conn, server *SQLiteServer, apiClient *A
 		_ = tcp.SetKeepAlivePeriod(c64KeepAlivePeriod)
 	}
 
+	// Per-connection retargeting: the cart's TCP source IP IS the Ultimate's
+	// IP. UCI runs on the C64 but the Ultimate firmware owns the network
+	// stack and is the actual socket endpoint, so accept() hands us the
+	// Ultimate behind the cart for free. Build a fresh APIClient pointed at
+	// that Ultimate so RUN/RUNFILE/UPLOADFILE/DOWNLOAD route back to the
+	// cart that issued the command instead of whichever fixed -host the
+	// server was started with. Falls back to the shared default if the
+	// peer isn't a TCP address (shouldn't happen on a TCP listener).
+	if tcp, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		apiClient = NewAPIClient(tcp.IP.String())
+	}
+
 	remoteAddr := conn.RemoteAddr().String()
-	slog.Info("C64 client connected", "remote", remoteAddr)
+	slog.Info("C64 client connected", "remote", remoteAddr, "ultimate", apiClient.Host)
 
 	// Send greeting
 	conn.Write([]byte("OK Assembly64 Browser\n"))

@@ -166,7 +166,7 @@ Start the C64 protocol server for the C64 client:
 ```
 
 **Options:**
-- `-host <ip>` - C64 Ultimate hostname or IP address (default: `c64u`)
+- `-host <ip>` - Fallback C64 Ultimate hostname or IP address (default: `c64u`). For cart connections on `-port`, the server auto-detects the target Ultimate from the cart's TCP peer IP (UCI runs on the C64 but the Ultimate firmware owns the network stack, so the inbound connection's source IP *is* the Ultimate's IP). That makes multiple Ultimates on the LAN work out of the box — each cart's RUN/RUNFILE/UPLOADFILE/DOWNLOAD routes back to its own Ultimate. `-host` is only consulted when there's no peer to infer from (the Spiffy HTTP listener and the standalone `tui`, `load`, `ftp`, `poke`, `debug` subcommands).
 - `-db <path>` - Path to SQLite database file (default: `c64uploader.db` in assembly64 directory)
 - `-assembly64 <path>` - Path to Assembly64 collection (default: `~/Downloads/assembly64`)
 - `-myfiles <path>` - Path to the My Files directory exposed to the C64 client's **My Files** browser (default: `<assembly64>/Myfiles`). `~/` is expanded. Subdirectories are walked when the user navigates into them — e.g. drop `.ue2` firmware patches in `<assembly64>/Myfiles/Firmware/` to see them there.
