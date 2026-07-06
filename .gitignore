@@ -1,2 +1,16 @@
 uploader/c64uploader
 c64client/build/*
+
+# Build artifacts
+/c64uploader
+crt/
+
+# Local data / collections
+myfiles/
+CSDB
+
+# Local tooling (personal, not shared)
+.claude/
+_bmad/
+_bmad-output/
+_debug-session-findings.md
