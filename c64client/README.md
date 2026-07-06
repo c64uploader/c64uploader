@@ -23,7 +23,7 @@ make crt
 make d64
 ```
 
-`make crt` adds `-tf=crt -csub=1` (EasyFlash, REU-aware subtype 1). The vanilla 16 KB CRT16 slot can't hold the binary anymore, so the EasyFlash format is the only cart target. `-dNOFLOAT` is on by default — we never format floats, and dropping the oscar64 float-printf helpers saves ~1.6 KB. Both `.prg` and `.crt` are supported deployments; the cart requires the firmware setting `Modem Settings → ACIA (6551) Mapping = Off`. See [docs/architecture-c64client.md](../docs/architecture-c64client.md#easyflash--tfcrt-build-target) for the full investigation.
+`make crt` adds `-tf=crt -csub=1` (EasyFlash, REU-aware subtype 1). The vanilla 16 KB CRT16 slot can't hold the binary anymore, so the EasyFlash format is the only cart target. The whole image must fit a single EasyFlash bank (it's decompressed from bank 0 into RAM at boot); **multi-bank EasyFlash is not viable on the C64 Ultimate** — see the architecture doc's "Why not multi-bank". To stay under the 16 KB bank-0 ceiling the build uses `-Oo` (outliner) and `-Oz` (zero-page globals) in addition to `-O2`; these are load-bearing, not optional. `-dNOFLOAT` is on by default — we never format floats, and dropping the oscar64 float-printf helpers saves ~1.6 KB. Both `.prg` and `.crt` are supported deployments; the cart requires the firmware setting `Modem Settings → ACIA (6551) Mapping = Off`. See [docs/architecture-c64client.md](../docs/architecture-c64client.md#easyflash--tfcrt-build-target) for the full investigation.
 
 Prebuilt binaries are committed under [dist/](dist/) so users can deploy without installing oscar64.
 
@@ -190,6 +190,7 @@ When viewing a list of entries (from a letter, a Top 200, a search result, etc.)
 | **N / P** | Next / previous page (20 per page) |
 | **Return** | Run entry (or open Releases if multiple versions exist) |
 | **cursor right** | Open Releases for a grouped entry |
+| **D** | Save entry's primary file to the Ultimate's `/Temp/` (FTP, original filename, no launch) |
 | **I** | Show info (title, group, year, type, top200, rating) |
 | **DEL / cursor left** | Back to parent menu |
 
@@ -224,6 +225,7 @@ When expanding a grouped entry (pressing **>**), you see all releases:
 - Shows cracker/release group name
 - Displays trainer count (+N) if available
 - Press **Return** to run a specific release
+- Press **D** to save the release's primary file to the Ultimate's `/Temp/` without launching
 - Press **Del** to go back to the previous list
 
 ### Info Screen
@@ -254,6 +256,17 @@ category tree and run the same way. One exception: **`.ue2` firmware/flash-patch
 Ultimate's `/Temp` directory via FTP (status shows `uploading...` → `OK Uploaded /Temp/...`)
 and does **not** launch anything — there is no firmware-flash REST endpoint, so you apply the
 patch yourself from the Ultimate's on-device menu afterward.
+
+### Saving without launching (D key)
+
+Pressing **D** on any entry (in a category list, search results, or releases view) transfers
+the entry's primary file to the Ultimate's `/Temp/` via FTP **without launching it**, preserving
+the original filename. Status shows `downloading...` → `OK Saved /Temp/<name>`. From the
+Ultimate's on-device file manager you can then move the file to a real SD card or USB
+destination if you want to keep it. In the **My Files** browser, **D** does the same thing
+via UPLOADFILE — useful if you want to copy a `.prg` or `.d64` to the device without running
+it. (`.ue2` firmware files keep their upload-only behavior on Return, so D and Return are
+equivalent for those.)
 
 ### Tips
 

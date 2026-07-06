@@ -24,10 +24,16 @@ D64 = $(OUTDIR)/$(PROJECT).d64
 # Compiler flags
 # -n  = native code (faster)
 # -O2 = optimization level 2
+# -Oo = outliner: factor repeated code sequences into shared subroutines (~1.4KB)
+# -Oz = auto-place globals in zero page (smaller + faster)
 # -tm = target machine (c64)
 # -dNOFLOAT = omit float formatting from printf — we never format floats and
 #             this strips ~1.6KB of unused nformf / faddsub / crt_fdiv code.
-CFLAGS = -n -O2 -tm=c64 -dNOFLOAT
+# -Oo/-Oz are what keep the EasyFlash .crt's resident image inside the single
+# 16 KB bank-0 ROM. Multi-bank EasyFlash is NOT viable on the C64 Ultimate's
+# cart emulation (see docs/architecture-c64client.md "Why not multi-bank"), so
+# the binary must fit one bank; these size optimizations are load-bearing.
+CFLAGS = -n -O2 -Oo -Oz -tm=c64 -dNOFLOAT
 
 # Add include path if specified
 ifneq ($(OSCAR64_INCLUDE),)

@@ -340,6 +340,44 @@ JMP $FCE2              ; full KERNAL cold-reset — IOINIT, RAMTAS,
 
 The full `$FCE2` path runs every initialization a hardware reset would, leaving the system indistinguishable from a fresh boot. Earlier intermediate attempts (`CINT + BASIC NEW`, `BASIC cold-start $E394`) appeared to work on the first F7 — printing "READY." — but left the system in a fragile state where a subsequent F7 keypress at the BASIC prompt could hang or corrupt the screen, because zero page, IRQ vectors, or `$0001` were not fully reinitialized. Going through `$FCE2` from a properly-disabled-cart starting state fixes that. The earlier `JMP $FCE2` attempts hung only because the previous EF disable value (`$87`) hadn't actually hidden the cart, so KERNAL was reading garbage from `$E000` on a cart still mapped to Ultimax. With `$04` the cart is genuinely off-bus before KERNAL starts.
 
+**4. Staying inside one 16 KB bank — why not multi-bank.** The resident image (code + data) is LZ-compressed into **bank 0** at link time and decompressed into RAM at boot, so it must fit one 16 KB EasyFlash bank. As features landed the compressed image outgrew it and `make crt` started failing with `error 3034: Can not fit main region into first ROM bank` (the `.prg` build is unaffected — it has no bank limit). The obvious fix is to page self-contained subsystems (e.g. the config screen) into a second EasyFlash bank and run them from ROM, oscar64-sample style. **That does not work on the C64 Ultimate's cart emulation** — verified empirically over a long hardware debug session (2026-05-25). The cart is kept under one bank with size optimization (`-Oo -Oz`, see the Makefile) instead.
+
+What was tried and what the hardware actually does (all probed live via the REST `readmem`/`writemem` DMA and on-cart marker bytes):
+
+- A two-bank `.crt` builds correctly (`#pragma section(bcode1)` / `#pragma region(bank1, 0x8000, 0xc000, , 1, …)`, `__noinline` impls in `bcode1` with resident wrappers that set the `$DE00` bank register). The file's CHIP packets for bank 0 and bank 1 both carry the right content.
+- The bank register **does** respond and the cart **is** loaded: with the cart mapped, the running CPU reads bank 0 `$8000`=`09 80` and bank 1 `$8000`=`a2 03 b5` (exactly `load_settings_impl`). (`run_crt` loads all banks too — an earlier "single-bank" conclusion was wrong; it came from reading bank 1 with the cart *unmapped*.)
+- **The blocker:** after the oscar64 boot stub decompresses bank 0 into RAM it *disables the cart for the CPU*, so `$8000` reads RAM. Re-mapping the cart ROM for the CPU is only possible with **`$DE02 = $00`** (Ultimax) — and a direct memory test proved `$DE02=$00` **opens `$1000–$7FFF`** (write `5A` to `$2000`, read back `FF` under `$00`, `5A` again under `$04`). The 8 K/16 K control values (`$06/$07/$86/$87`) don't map the cart ROM at all on this firmware; `$04` maps neither ROM nor the UCI registers at `$DE1C` (hangs `uci_identify`).
+- So there is **no `$DE02` mode that simultaneously** exposes the bank ROM at `$8000`, keeps the resident helpers in `$1000–$7FFF` readable, and keeps UCI alive — but banked code needs all three (it runs from `$8000`, calls `print_at`/`uci_*`/`sprintf` in `$1000–$7FFF`, and the browser needs UCI). The one mode that maps the bank ROM hides the very RAM the banked code calls into.
+
+Two oscar64 footguns found along the way (worth keeping if banking is ever revisited): `<c64/easyflash.h>`'s `eflash` macro casts to a bare `EasyFlash` type that only names a type in C++ (C parse error), and a function-like macro expanding to a `$DExx` store mis-parses as a statement (`error 3006`); open-code the store instead.
+
+**It's specifically a subtype-1 constraint, not multi-bank in general.** Multi-bank
+EasyFlash works fine on the Ultimate — oscar64's own multi-bank sample
+(`samples/memmap/easyflashshared.crt`, 7 banks, 14 CHIPs, same decompress-to-RAM
++ banked-ROM model as ours) is **subtype 0**, and the device ships working
+multi-bank carts (Retro Replay, Final Cartridge III, …). We are forced to
+**subtype 1** because that's the only mode that exposes UCI (relocated to `$DE1C`);
+subtype 0 makes the firmware claim `$DF00-$DFFF` and hides UCI. Under subtype 1,
+reading any bank ROM requires `$DE02=$00` (Ultimax), which opens `$1000-$7FFF`.
+Because every banking mechanism needs to read a bank while resident code runs,
+each hits that wall:
+- runtime banked calls — the bank-map mode hides the `$1000-$7FFF` helpers the
+  banked code calls;
+- oscar64 **inlays** / compressed-section expand — `oscar_expand_lzo` itself lives
+  in `$1000-$7FFF`, open while the bank is mapped;
+- a bigger boot image — oscar64 decompresses only bank 0 into RAM, not multiple;
+- disk/KERNAL overlays — the cart bypasses the KERNAL.
+
+**If banking is ever truly needed under subtype 1**, the only viable shape is a
+hand-written **low-RAM trampoline**: a copy/expand routine placed below `$1000`
+(the only RAM that survives Ultimax) that pages a bank in (`$DE02=$00`), copies
+the banked code into free RAM, pages back to the cart-hidden state, and runs it
+from RAM where both it and the resident helpers are reachable — plus discovering
+the exact cart-hidden-but-UCI-live `$DE02` value (the boot's off-state). That's a
+substantial, firmware-specific asm effort and was deliberately not pursued.
+`-Oo -Oz` keeps the image in one bank with headroom for now; revisit only if the
+cart actually outgrows a single bank again.
+
 ## Configuration
 
 **Compile-time defaults (main.c):**
