@@ -831,6 +831,19 @@ uint8_t uci_tcp_get_listen_socket(void)
 // Network - convenience read functions
 //-----------------------------------------------------------------------------
 
+// Silent-server timeout for uci_tcp_nextchar, in seconds of wall time.
+// It is time, not a retry count: an empty READ costs whatever the firmware
+// makes it cost (about 40 ms on 3.12a-3.15, a few ms where READ does not
+// wait), so 500 retries meant anything from ~20 s down to ~1.6 s.
+#define UCI_READ_TIMEOUT_SECS 20
+
+// CIA1 time-of-day clock. It counts the 50/60 Hz mains tick and needs no
+// IRQ, so it also runs under the cart targets, where the KERNAL jiffy
+// clock at $A2 is frozen (see main.c).
+#define CIA1_TOD_10THS (*(volatile uint8_t *)0xDC08)
+#define CIA1_TOD_SEC   (*(volatile uint8_t *)0xDC09)
+#define CIA1_CRB       (*(volatile uint8_t *)0xDC0F)
+
 char uci_tcp_nextchar(uint8_t socketid)
 {
     char result;
@@ -842,19 +855,31 @@ char uci_tcp_nextchar(uint8_t socketid)
     }
     else
     {
-        int retries = 0;
+        uint8_t secs = 0, last, now;
+
+        CIA1_CRB &= 0x7F;           // TOD writes set the clock, not the alarm
+        CIA1_TOD_10THS = 0;         // starts a stopped TOD
+        last = CIA1_TOD_SEC;
         do
         {
             uci_data_len = uci_socket_read(socketid, UCI_DATA_QUEUE_SZ - 4);
             if (uci_data_len == 0)
                 return 0; // EOF
-            if (++retries > 500)
-                return 0; // Timeout - connection likely dead.
-                          // 500 retries is enough for any responsive
-                          // server. Was 5000, but each retry now goes
-                          // through uci_readstatus' bounded STAT_AV
-                          // wait, and 5000 × that pushed the silent-
-                          // server timeout into the tens of seconds.
+            (void)CIA1_TOD_10THS;       // reading the tenths releases a latch
+            now = CIA1_TOD_SEC;
+            if (now != last)
+            {
+                // Elapsed seconds (BCD, wraps at 60), not register changes
+                do
+                {
+                    last = (last & 0x0F) == 9 ? (last + 7) : (last + 1);
+                    if (last == 0x60)
+                        last = 0;
+                    secs++;
+                } while (last != now && secs < UCI_READ_TIMEOUT_SECS);
+                if (secs >= UCI_READ_TIMEOUT_SECS)
+                    return 0; // Timeout - connection likely dead.
+            }
         } while (uci_data_len == -1);
 
         result = uci_data[2];
