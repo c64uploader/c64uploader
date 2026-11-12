@@ -844,7 +844,8 @@ uint8_t uci_tcp_get_listen_socket(void)
 #define CIA1_TOD_SEC   (*(volatile uint8_t *)0xDC09)
 #define CIA1_CRB       (*(volatile uint8_t *)0xDC0F)
 
-static bool tod_started;
+// TOD seconds are BCD
+#define TOD_BIN(x) ((((x) >> 4) << 3) + (((x) >> 4) << 1) + ((x) & 0x0F))
 
 char uci_tcp_nextchar(uint8_t socketid)
 {
@@ -859,13 +860,8 @@ char uci_tcp_nextchar(uint8_t socketid)
     {
         uint8_t secs = 0, last, now;
 
-        if (!tod_started)
-        {
-            CIA1_CRB &= 0x7F;       // TOD writes set the clock, not the alarm
-            CIA1_TOD_10THS = 0;     // writing the tenths starts a stopped TOD
-            tod_started = true;
-        }
-        (void)CIA1_TOD_10THS;       // reading the tenths releases a latch
+        CIA1_CRB &= 0x7F;           // TOD writes set the clock, not the alarm
+        CIA1_TOD_10THS = 0;         // starts a stopped TOD; also frees a latch
         last = CIA1_TOD_SEC;
         do
         {
@@ -876,8 +872,15 @@ char uci_tcp_nextchar(uint8_t socketid)
             now = CIA1_TOD_SEC;
             if (now != last)
             {
-                last = now;
-                if (++secs >= UCI_READ_TIMEOUT_SECS)
+                // Elapsed seconds (BCD, wraps at 60), not register changes
+                do
+                {
+                    last = (last & 0x0F) == 9 ? (last + 7) : (last + 1);
+                    if (last == 0x60)
+                        last = 0;
+                    secs++;
+                } while (last != now);
+                if (secs >= UCI_READ_TIMEOUT_SECS)
                     return 0; // Timeout - connection likely dead.
             }
         } while (uci_data_len == -1);
